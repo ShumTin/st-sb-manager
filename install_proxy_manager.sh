@@ -7,12 +7,39 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
+install -d -m 755 /run/lock
+exec 9>/run/lock/proxy-manager-install.lock
+if ! flock -n 9; then
+  echo "已有另一个安装程序正在运行。"
+  exit 1
+fi
+
 TEMP_SWAP=0
+TEMP_SWAP_CREATED=0
+BUILD_ROOT=""
+INSTALL_SUCCEEDED=0
+SING_BOX_WAS_ACTIVE=0
+PROXY_MANAGER_WAS_ACTIVE=0
 cleanup() {
+  local exit_code=$?
   if [[ "$TEMP_SWAP" == "1" ]] && swapon --show=NAME --noheadings | grep -qx '/swapfile-proxy-build'; then
     swapoff /swapfile-proxy-build || true
+  fi
+  if [[ "$TEMP_SWAP_CREATED" == "1" ]]; then
     rm -f /swapfile-proxy-build
   fi
+  if [[ -n "$BUILD_ROOT" && -d "$BUILD_ROOT" ]]; then
+    rm -rf -- "$BUILD_ROOT"
+  fi
+  if [[ "$INSTALL_SUCCEEDED" != "1" ]]; then
+    if [[ "$SING_BOX_WAS_ACTIVE" == "1" ]]; then
+      systemctl start sing-box >/dev/null 2>&1 || true
+    fi
+    if [[ "$PROXY_MANAGER_WAS_ACTIVE" == "1" ]]; then
+      systemctl start proxy-manager >/dev/null 2>&1 || true
+    fi
+  fi
+  return "$exit_code"
 }
 trap cleanup EXIT
 trap 'echo "安装在第 ${LINENO} 行失败，请保留终端报错信息。" >&2' ERR
@@ -86,9 +113,32 @@ for old_path in \
   /root/node-info.txt \
   /root/proxy-links.txt; do
   if [[ -e "$old_path" ]]; then
-    cp -a "$old_path" "$BACKUP_DIR/"
+    cp -a --parents "$old_path" "$BACKUP_DIR/"
   fi
 done
+
+OLD_REALITY_PORT=""
+OLD_ANYTLS_PORT=""
+OLD_HY2_PORT=""
+if [[ -f /etc/proxy-manager/config.json ]]; then
+  mapfile -t OLD_PORT_VALUES < <(python3 - <<'PY' || true
+import json
+
+try:
+    with open("/etc/proxy-manager/config.json", encoding="utf-8") as handle:
+        ports = json.load(handle)["ports"]
+    for name in ("reality", "anytls", "hysteria2"):
+        print(int(ports[name]))
+except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    pass
+PY
+  )
+  if (( ${#OLD_PORT_VALUES[@]} == 3 )); then
+    OLD_REALITY_PORT=${OLD_PORT_VALUES[0]}
+    OLD_ANYTLS_PORT=${OLD_PORT_VALUES[1]}
+    OLD_HY2_PORT=${OLD_PORT_VALUES[2]}
+  fi
+fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -187,26 +237,28 @@ if ! "$SB_BIN" version 2>/dev/null | grep -q 'with_v2ray_api'; then
   esac
   if [[ -z "$(swapon --show=NAME --noheadings)" ]]; then
     fallocate -l 2G /swapfile-proxy-build
+    TEMP_SWAP_CREATED=1
     chmod 600 /swapfile-proxy-build
     mkswap /swapfile-proxy-build >/dev/null
     swapon /swapfile-proxy-build
     TEMP_SWAP=1
   fi
-  BUILD_ROOT=/opt/proxy-build
-  rm -rf "$BUILD_ROOT"
-  mkdir -p "$BUILD_ROOT" /tmp/singbox-build-bin
+  BUILD_ROOT=$(mktemp -d /opt/proxy-build.XXXXXX)
+  BUILD_BIN_DIR="$BUILD_ROOT/bin"
+  GO_ARCHIVE="$BUILD_ROOT/go.tar.gz"
+  mkdir -p "$BUILD_BIN_DIR"
   GO_VERSION=$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1)
-  curl -fL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o /tmp/go-proxy-build.tar.gz
-  tar -C "$BUILD_ROOT" -xzf /tmp/go-proxy-build.tar.gz
+  curl -fL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o "$GO_ARCHIVE"
+  tar -C "$BUILD_ROOT" -xzf "$GO_ARCHIVE"
   SB_VERSION=$($SB_BIN version | awk '/sing-box version/ {gsub(/^v/, "", $3); print $3; exit}')
   if [[ -z "$SB_VERSION" ]]; then
     echo "无法识别 sing-box 版本。"
     exit 1
   fi
-  HOME=/root GOBIN=/tmp/singbox-build-bin CGO_ENABLED=0 GOMAXPROCS=1 \
+  HOME=/root GOBIN="$BUILD_BIN_DIR" CGO_ENABLED=0 GOMAXPROCS=1 \
     GOFLAGS='-p=1 -tags=with_quic,with_utls,with_v2ray_api' \
     "$BUILD_ROOT/go/bin/go" install "github.com/sagernet/sing-box/cmd/sing-box@v${SB_VERSION}"
-  install -m 755 /tmp/singbox-build-bin/sing-box /usr/local/bin/sing-box
+  install -m 755 "$BUILD_BIN_DIR/sing-box" /usr/local/bin/sing-box
   SB_BIN=/usr/local/bin/sing-box
 fi
 
@@ -259,6 +311,13 @@ systemctl reload nginx
 
 install -d -m 700 /etc/sing-box /etc/proxy-manager /opt/proxy-manager
 install -d -m 700 /var/lib/proxy-manager
+if systemctl is-active --quiet sing-box 2>/dev/null; then
+  SING_BOX_WAS_ACTIVE=1
+fi
+if systemctl is-active --quiet proxy-manager 2>/dev/null; then
+  PROXY_MANAGER_WAS_ACTIVE=1
+fi
+systemctl stop proxy-manager sing-box 2>/dev/null || true
 rm -f /var/lib/proxy-manager/usage.db /var/lib/proxy-manager/usage.db-shm /var/lib/proxy-manager/usage.db-wal
 rm -f /var/lib/proxy-manager/audit.db /var/lib/proxy-manager/audit.db-shm /var/lib/proxy-manager/audit.db-wal
 
@@ -475,12 +534,18 @@ def init_db():
                 download INTEGER NOT NULL DEFAULT 0,
                 period TEXT NOT NULL,
                 blocked INTEGER NOT NULL DEFAULT 0,
-                blocked_reason TEXT NOT NULL DEFAULT ''
+                blocked_reason TEXT NOT NULL DEFAULT '',
+                last_upload INTEGER NOT NULL DEFAULT 0,
+                last_download INTEGER NOT NULL DEFAULT 0
             )
         """)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(usage)")}
         if "blocked_reason" not in columns:
             conn.execute("ALTER TABLE usage ADD COLUMN blocked_reason TEXT NOT NULL DEFAULT ''")
+        if "last_upload" not in columns:
+            conn.execute("ALTER TABLE usage ADD COLUMN last_upload INTEGER NOT NULL DEFAULT 0")
+        if "last_download" not in columns:
+            conn.execute("ALTER TABLE usage ADD COLUMN last_download INTEGER NOT NULL DEFAULT 0")
         period = datetime.now(TZ).strftime("%Y-%m-%d")
         for name in USERS_BY_NAME:
             conn.execute(
@@ -553,7 +618,7 @@ def parse_stats_response(data):
             raise ValueError("unsupported protobuf wire type")
     return stats
 
-def query_and_reset_stats():
+def query_stats():
     channel = grpc.insecure_channel(CONFIG["grpc_address"])
     call = channel.unary_unary(
         "/v2ray.core.app.stats.command.StatsService/QueryStats",
@@ -561,10 +626,28 @@ def query_and_reset_stats():
         response_deserializer=lambda value: value,
     )
     try:
-        response = call(b"\x10\x01", timeout=4)
+        # 不清空 sing-box 累计计数；只有数据库提交成功后才推进本地检查点。
+        response = call(b"", timeout=4)
         return parse_stats_response(response)
     finally:
         channel.close()
+
+def write_text_atomic(path, text):
+    fd, temp_path = tempfile.mkstemp(prefix=f"{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
 
 def apply_blocking(blocked_names):
     path = Path(CONFIG["singbox_config"])
@@ -581,42 +664,33 @@ def apply_blocking(blocked_names):
     new_text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
     if new_text == original_text:
         return
-    fd, temp_path = tempfile.mkstemp(prefix="config.", suffix=".json", dir=str(path.parent))
+    fd, temp_path = tempfile.mkstemp(prefix="config-check.", suffix=".json", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w") as handle:
             handle.write(new_text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temp_path, 0o600)
         subprocess.run(
             [CONFIG["singbox_binary"], "check", "-c", temp_path],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
-        os.replace(temp_path, path)
+        os.unlink(temp_path)
+        write_text_atomic(path, new_text)
         subprocess.run(["systemctl", "restart", "sing-box"], check=True, timeout=30)
     except Exception:
         try:
             os.unlink(temp_path)
         except FileNotFoundError:
             pass
+        # 配置已替换但服务重启失败时恢复旧文件，使下一轮仍会重试封禁变更。
+        if path.read_text() == new_text:
+            write_text_atomic(path, original_text)
+            subprocess.run(["systemctl", "restart", "sing-box"], check=False, timeout=30)
         raise
 
 def save_manager_config():
     text = json.dumps(CONFIG, ensure_ascii=False, indent=2) + "\n"
-    fd, temp_path = tempfile.mkstemp(prefix="config.", suffix=".json", dir=str(CONFIG_PATH.parent))
-    try:
-        with os.fdopen(fd, "w") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temp_path, 0o600)
-        os.replace(temp_path, CONFIG_PATH)
-    except Exception:
-        try:
-            os.unlink(temp_path)
-        except FileNotFoundError:
-            pass
-        raise
+    write_text_atomic(CONFIG_PATH, text)
 
 def add_calendar_months(value, months, anchor_day):
     month_index = value.year * 12 + value.month - 1 + months
@@ -626,7 +700,7 @@ def add_calendar_months(value, months, anchor_day):
     return value.replace(year=year, month=month, day=day)
 
 def renew_expired_users(now_ts):
-    renewed = []
+    renewed = {}
     now = datetime.fromtimestamp(now_ts, BILLING_TZ)
     for user in USERS_BY_NAME.values():
         expiry = datetime.fromtimestamp(int(user["expires_at"]), BILLING_TZ)
@@ -636,17 +710,26 @@ def renew_expired_users(now_ts):
         anchor_day = int(user["renewal_day"])
         while expiry <= now:
             expiry = add_calendar_months(expiry, renewal_months, anchor_day)
-        user["expires_at"] = int(expiry.timestamp())
-        renewed.append(user["name"])
+        renewed[user["name"]] = int(expiry.timestamp())
     if not renewed:
         return
-    save_manager_config()
     with db() as conn:
-        for name in renewed:
-            conn.execute(
-                "UPDATE usage SET upload=0, download=0, blocked=0, blocked_reason='', period=? WHERE name=?",
-                (datetime.now(TZ).strftime("%Y-%m-%d"), name),
-            )
+        old_expiries = {name: USERS_BY_NAME[name]["expires_at"] for name in renewed}
+        try:
+            for name, expires_at in renewed.items():
+                USERS_BY_NAME[name]["expires_at"] = expires_at
+                conn.execute(
+                    "UPDATE usage SET upload=0, download=0, blocked=0, blocked_reason='', period=? WHERE name=?",
+                    (datetime.now(TZ).strftime("%Y-%m-%d"), name),
+                )
+            save_manager_config()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            for name, expires_at in old_expiries.items():
+                USERS_BY_NAME[name]["expires_at"] = expires_at
+            save_manager_config()
+            raise
 
 STAT_PATTERN = re.compile(r"^user>>>([^>]+)>>>traffic>>>(uplink|downlink)$")
 
@@ -654,21 +737,31 @@ def collect_once():
     with LOCK:
         now_ts = int(datetime.now(TZ).timestamp())
         renew_expired_users(now_ts)
-        stats = query_and_reset_stats()
-        deltas = {name: {"uplink": 0, "downlink": 0} for name in USERS_BY_NAME}
+        stats = query_stats()
+        counters = {name: {"uplink": 0, "downlink": 0} for name in USERS_BY_NAME}
         for stat_name, value in stats.items():
             match = STAT_PATTERN.match(stat_name)
-            if match and match.group(1) in deltas:
-                deltas[match.group(1)][match.group(2)] += max(0, int(value))
-        changed = any(parts["uplink"] or parts["downlink"] for parts in deltas.values())
+            if match and match.group(1) in counters:
+                counters[match.group(1)][match.group(2)] += max(0, int(value))
         with db() as conn:
-            if changed:
-                for name, parts in deltas.items():
-                    if parts["uplink"] or parts["downlink"]:
-                        conn.execute(
-                            "UPDATE usage SET upload=upload+?, download=download+? WHERE name=?",
-                            (parts["uplink"], parts["downlink"], name),
-                        )
+            rows_by_name = {
+                row["name"]: row
+                for row in conn.execute(
+                    "SELECT name,upload,download,blocked,last_upload,last_download FROM usage"
+                )
+            }
+            for name, parts in counters.items():
+                row = rows_by_name.get(name)
+                if row is None:
+                    continue
+                current_upload = parts["uplink"]
+                current_download = parts["downlink"]
+                upload_delta = current_upload - row["last_upload"] if current_upload >= row["last_upload"] else current_upload
+                download_delta = current_download - row["last_download"] if current_download >= row["last_download"] else current_download
+                conn.execute(
+                    "UPDATE usage SET upload=upload+?, download=download+?, last_upload=?, last_download=? WHERE name=?",
+                    (upload_delta, download_delta, current_upload, current_download, name),
+                )
             rows = conn.execute("SELECT name, upload, download, blocked FROM usage").fetchall()
             for row in rows:
                 user = USERS_BY_NAME.get(row["name"])
@@ -1277,6 +1370,7 @@ cat > /opt/proxy-manager/audit_supervisor.py <<'PY'
 import ipaddress
 import json
 import os
+import queue
 import re
 import signal
 import sqlite3
@@ -1356,6 +1450,61 @@ def cleanup_loop():
         time.sleep(3600)
 
 
+class AuditWriter:
+    """批量持久化审计事件，避免 SQLite I/O 阻塞 sing-box 日志管道。"""
+
+    def __init__(self):
+        self.events = queue.Queue(maxsize=10000)
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.last_drop_warning = 0.0
+
+    def start(self):
+        self.thread.start()
+
+    def submit(self, event):
+        try:
+            self.events.put_nowait(event)
+        except queue.Full:
+            now = time.monotonic()
+            if now - self.last_drop_warning >= 10:
+                print("proxy audit queue full; events are being dropped", flush=True)
+                self.last_drop_warning = now
+
+    def close(self):
+        self.stopping.set()
+        self.thread.join(timeout=10)
+        if self.thread.is_alive():
+            print("proxy audit writer did not stop cleanly", flush=True)
+
+    def _run(self):
+        conn = open_db()
+        try:
+            while not self.stopping.is_set() or not self.events.empty():
+                batch = []
+                try:
+                    batch.append(self.events.get(timeout=0.5))
+                except queue.Empty:
+                    continue
+                while len(batch) < 100:
+                    try:
+                        batch.append(self.events.get_nowait())
+                    except queue.Empty:
+                        break
+                try:
+                    conn.executemany(
+                        "INSERT INTO access_events(ts,user,protocol,destination,port,network) "
+                        "VALUES(?,?,?,?,?,?)",
+                        batch,
+                    )
+                    conn.commit()
+                except sqlite3.Error:
+                    conn.rollback()
+                    print("proxy audit database batch write failed", flush=True)
+        finally:
+            conn.close()
+
+
 def split_destination(value):
     value = value.strip()
     if not value or any(mark in value for mark in ("/", "?", "#", "@")):
@@ -1416,7 +1565,8 @@ def main():
         bufsize=1,
     )
     contexts = {}
-    conn = open_db()
+    writer = AuditWriter()
+    writer.start()
     print("sing-box started with sanitized 7-day destination audit", flush=True)
     try:
         for raw_line in process.stdout:
@@ -1434,22 +1584,16 @@ def main():
                 if user in VALID_USERS and destination is not None:
                     protocol = contexts.get(connection_id, ("未知", now_mono))[0]
                     host, port = destination
-                    try:
-                        conn.execute(
-                            "INSERT INTO access_events(ts,user,protocol,destination,port,network) "
-                            "VALUES(?,?,?,?,?,?)",
-                            (int(time.time()), user, protocol, host, port, "UDP" if packet_word else "TCP"),
-                        )
-                        conn.commit()
-                    except sqlite3.Error:
-                        print("proxy audit database write failed", flush=True)
+                    writer.submit(
+                        (int(time.time()), user, protocol, host, port, "UDP" if packet_word else "TCP")
+                    )
             if len(contexts) > 20000:
                 contexts = {
                     key: value for key, value in contexts.items()
                     if now_mono - value[1] < 3600
                 }
     finally:
-        conn.close()
+        writer.close()
         if process.poll() is None:
             process.terminate()
         return_code = process.wait()
@@ -1695,8 +1839,11 @@ chmod 755 /etc/letsencrypt/renewal-hooks/deploy/reload-proxy-services
 python3 -m py_compile \
   /opt/proxy-manager/manager.py \
   /opt/proxy-manager/audit_supervisor.py \
+  /usr/local/sbin/proxy-user-add \
   /usr/local/sbin/proxy-user-status \
   /usr/local/sbin/proxy-audit
+bash -n /usr/local/sbin/proxy
+sh -n /etc/letsencrypt/renewal-hooks/deploy/reload-proxy-services
 nginx -t
 "$SB_BIN" check -c /etc/sing-box/config.json
 systemctl daemon-reload
@@ -1731,6 +1878,15 @@ HY2_PORT=${PORT_VALUES[2]}
 
 echo "正在配置 UFW；将先放行当前 SSH 端口 ${SSH_PORT}/TCP……"
 ufw allow "${SSH_PORT}/tcp" comment 'SSH - do not delete'
+if [[ -n "$OLD_REALITY_PORT" && "$OLD_REALITY_PORT" != "$REALITY_PORT" ]]; then
+  ufw --force delete allow "${OLD_REALITY_PORT}/tcp" || true
+fi
+if [[ -n "$OLD_ANYTLS_PORT" && "$OLD_ANYTLS_PORT" != "$ANYTLS_PORT" ]]; then
+  ufw --force delete allow "${OLD_ANYTLS_PORT}/tcp" || true
+fi
+if [[ -n "$OLD_HY2_PORT" && "$OLD_HY2_PORT" != "$HY2_PORT" ]]; then
+  ufw --force delete allow "${OLD_HY2_PORT}/udp" || true
+fi
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 80/tcp comment 'ACME HTTP'
@@ -1744,6 +1900,8 @@ if ! ufw status | grep -q '^Status: active'; then
   echo "UFW 启用失败，安装终止。"
   exit 1
 fi
+
+INSTALL_SUCCEEDED=1
 
 echo
 echo "=== 安装完成 ==="
