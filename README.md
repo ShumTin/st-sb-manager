@@ -44,7 +44,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ShumTin/st-sb-manager/master
 - Let's Encrypt 邮箱
 - VPS 标称带宽
 - SSH 端口
-- 可选的 KiwiVM VEID 和 API Key
+- 可选的 KiwiVM VEID 和 API Key（用于调用 BandwagonHost API，同步 VPS 流量重置日期；非搬瓦工 VPS 可直接跳过）
 
 KiwiVM API Key 只用于本次查询，不会保存。
 
