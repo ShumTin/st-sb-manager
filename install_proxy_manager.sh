@@ -1299,19 +1299,16 @@ pause_menu() {
 }
 
 show_menu() {
-  echo
-  echo "================ 代理节点管理 ================"
-  echo "1) 新增用户             proxy-user-add"
-  echo "2) 查看所有用户         proxy-user-status"
-  echo "3) 最近24小时访问审计   proxy-audit"
-  echo "4) 最近7天访问汇总      proxy-audit --summary --days 7"
-  echo "5) 检查 sing-box 配置   sing-box check"
-  echo "6) 查看服务状态         systemctl status"
-  echo "7) 查看最近服务日志     journalctl"
-  echo "8) 查看防火墙规则       ufw status numbered"
-  echo "9) 查看节点安装信息     /root/node-info.txt"
-  echo "0) 退出"
-  echo "==============================================="
+  echo "
+╔──────────────────────────────────────────────────────╗
+│                     代理节点管理                     │
+├──────────────────────────┬───────────────────────────┤
+│  1. 新增用户             │  2. 用户状态              │
+│  3. 访问记录             │  4. 访问汇总              │
+│  5. 配置检查             │  6. 服务状态              │
+│  7. 服务日志             │  8. 防火墙                │
+│  9. 节点信息             │  0. 退出                  │
+╚──────────────────────────┴───────────────────────────╝"
 }
 
 add_user() {
@@ -1358,7 +1355,7 @@ show_node_info() {
 
 while true; do
   show_menu
-  read -r -p "请输入数字选择: " choice
+  read -r -p "请选择 [0-9]: " choice
   echo
   case "$choice" in
     1) add_user ;;
