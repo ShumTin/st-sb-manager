@@ -69,8 +69,8 @@ show_install_logo() {
 show_install_logo
 echo
 echo "=== 三协议动态用户管理 + 独立流量/到期策略 + 7天域名审计安装程序 ==="
-echo "协议：VLESS+REALITY、AnyTLS、Hysteria2"
-echo "说明：安装后使用 proxy-user-add 按需创建用户；重新安装会使旧订阅失效。"
+echo "协议：安装后按需启用 VLESS+REALITY、AnyTLS、Hysteria2"
+echo "说明：首次安装不启用代理协议；重新安装会使旧订阅失效。"
 echo
 read -r -p "请输入节点域名（例如 node.example.com）: " DOMAIN
 read -r -p "请输入用于 Let's Encrypt 的真实邮箱: " EMAIL
@@ -158,7 +158,7 @@ try:
     with open("/etc/proxy-manager/config.json", encoding="utf-8") as handle:
         ports = json.load(handle)["ports"]
     for name in ("reality", "anytls", "hysteria2"):
-        print(int(ports[name]))
+        print(ports.get(name, ""))
 except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
     pass
 PY
@@ -354,10 +354,6 @@ rm -f /var/lib/proxy-manager/audit.db /var/lib/proxy-manager/audit.db-shm /var/l
 DOMAIN="$DOMAIN" BANDWIDTH="$BANDWIDTH" SSH_PORT="$SSH_PORT" BACKUP_DIR="$BACKUP_DIR" SB_BIN="$SB_BIN" PROVIDER_NEXT_RESET="$PROVIDER_NEXT_RESET" python3 <<'PY'
 import json
 import os
-import re
-import secrets
-import socket
-import subprocess
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -370,45 +366,8 @@ sb_bin = os.environ["SB_BIN"]
 provider_next_reset = int(os.environ["PROVIDER_NEXT_RESET"])
 billing_timezone = "America/New_York"
 
-def run(*args):
-    return subprocess.check_output(args, text=True).strip()
-
-def random_port(used):
-    for _ in range(1000):
-        port = secrets.randbelow(40001) + 20000
-        if port in used:
-            continue
-        tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            tcp.bind(("0.0.0.0", port))
-            udp.bind(("0.0.0.0", port))
-        except OSError:
-            tcp.close()
-            udp.close()
-            continue
-        tcp.close()
-        udp.close()
-        used.add(port)
-        return port
-    raise RuntimeError("无法生成空闲随机端口")
-
-used_ports = {80, 443, 8080, 8787, ssh_port}
-port_names = ["reality", "anytls", "hysteria2"]
-ports = {name: random_port(used_ports) for name in port_names}
-
-keypair = run(sb_bin, "generate", "reality-keypair")
-private_match = re.search(r"PrivateKey:\s*(\S+)", keypair, re.I)
-public_match = re.search(r"PublicKey:\s*(\S+)", keypair, re.I)
-if not private_match or not public_match:
-    raise RuntimeError("REALITY 密钥生成失败")
-reality_private = private_match.group(1)
-reality_public = public_match.group(1)
-short_id = secrets.token_hex(8)
-reality_server = "www.cloudflare.com"
-hy2_obfs = secrets.token_hex(16)
-
 users = []
+ports = {}
 
 cert = f"/etc/letsencrypt/live/{domain}/fullchain.pem"
 key = f"/etc/letsencrypt/live/{domain}/privkey.pem"
@@ -455,25 +414,17 @@ manager_config = {
     "singbox_binary": sb_bin,
     "singbox_config": "/etc/sing-box/config.json",
     "ports": ports,
-    "reality_private_key": reality_private,
-    "reality_public_key": reality_public,
-    "reality_short_id": short_id,
-    "reality_server": reality_server,
-    "hy2_obfs_password": hy2_obfs,
+    "enabled_protocols": [],
     "users": users,
 }
 
 Path("/etc/sing-box/config.json").write_text(json.dumps(singbox_config, ensure_ascii=False, indent=2) + "\n")
 Path("/etc/proxy-manager/config.json").write_text(json.dumps(manager_config, ensure_ascii=False, indent=2) + "\n")
 
-protocol_lines = [
-    ("TCP", ports["reality"], "VLESS + REALITY"),
-    ("TCP", ports["anytls"], "AnyTLS"),
-    ("UDP", ports["hysteria2"], "Hysteria2"),
-]
 info = [
     f"域名: {domain}",
-    "用户管理: 安装后运行 proxy-user-add 按需创建",
+    "协议管理: 安装后运行 proxy 并选择 1，逐个启用所需协议",
+    "用户管理: 启用协议后运行 proxy 并选择 2，按需创建用户",
     "套餐策略: 每个用户独立设置流量、到期时间和自动续期",
     "计费时区: America/New_York（与搬瓦工计费周期一致）",
     "搬瓦工下次流量重置: " + (
@@ -490,12 +441,13 @@ info = [
     "云服务商安全组需要放行：",
     "TCP 80     Let's Encrypt 申请与续期",
     "TCP 443    HTTPS 订阅",
+    "代理协议端口: 尚未启用；安装后运行 proxy 并进入协议管理",
 ]
-info += [f"{proto:<7} {port:<5} {name}" for proto, port, name in protocol_lines]
 info += [
     "",
     "日常管理命令：",
     "proxy                              打开交互式管理菜单",
+    "proxy-protocol                     逐个启用代理协议",
     "proxy-update                       安全更新管理程序",
     "proxy-user-add                     新增用户",
     "proxy-user-status                  查看所有用户状态",
@@ -838,14 +790,17 @@ def status_names(user, row):
 def uri_links(user, row):
     d = CONFIG["domain"]
     p = CONFIG["ports"]
+    enabled = set(CONFIG.get("enabled_protocols", p))
     name1, name2 = status_names(user, row)
     def tag(value):
         return quote(value, safe="")
-    links = [
-        f"vless://{user['vless_reality_uuid']}@{d}:{p['reality']}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={CONFIG['reality_server']}&fp=chrome&pbk={CONFIG['reality_public_key']}&sid={CONFIG['reality_short_id']}&type=tcp#{tag('01 VLESS-REALITY')}",
-        f"anytls://{quote(user['anytls_password'], safe='')}@{d}:{p['anytls']}?security=tls&sni={d}&fp=chrome&type=tcp#{tag('02 AnyTLS')}",
-        f"hysteria2://{quote(user['hy2_password'], safe='')}@{d}:{p['hysteria2']}/?sni={d}&obfs=salamander&obfs-password={quote(CONFIG['hy2_obfs_password'], safe='')}#{tag('03 Hysteria2')}",
-    ]
+    links = []
+    if "reality" in enabled:
+        links.append(f"vless://{user['vless_reality_uuid']}@{d}:{p['reality']}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={CONFIG['reality_server']}&fp=chrome&pbk={CONFIG['reality_public_key']}&sid={CONFIG['reality_short_id']}&type=tcp#{tag('01 VLESS-REALITY')}")
+    if "anytls" in enabled:
+        links.append(f"anytls://{quote(user['anytls_password'], safe='')}@{d}:{p['anytls']}?security=tls&sni={d}&fp=chrome&type=tcp#{tag('02 AnyTLS')}")
+    if "hysteria2" in enabled:
+        links.append(f"hysteria2://{quote(user['hy2_password'], safe='')}@{d}:{p['hysteria2']}/?sni={d}&obfs=salamander&obfs-password={quote(CONFIG['hy2_obfs_password'], safe='')}#{tag('03 Hysteria2')}")
     dummy = "00000000-0000-0000-0000-000000000000"
     links.insert(0, f"vless://{dummy}@127.0.0.1:1?encryption=none&security=none&type=tcp#{tag(name1)}")
     links.insert(1, f"vless://{dummy}@127.0.0.1:2?encryption=none&security=none&type=tcp#{tag(name2)}")
@@ -858,30 +813,41 @@ def base64_subscription(user, row):
 def mihomo_subscription(user, row):
     d = CONFIG["domain"]
     p = CONFIG["ports"]
+    enabled = set(CONFIG.get("enabled_protocols", p))
     info1, info2 = status_names(user, row)
-    actual = [
-        {
+    actual = []
+    if "reality" in enabled:
+        actual.append({
             "name": "01 VLESS-REALITY", "type": "vless", "server": d, "port": p["reality"],
             "uuid": user["vless_reality_uuid"], "network": "tcp", "tls": True, "udp": True,
             "flow": "xtls-rprx-vision", "servername": CONFIG["reality_server"], "client-fingerprint": "chrome",
             "reality-opts": {"public-key": CONFIG["reality_public_key"], "short-id": CONFIG["reality_short_id"]},
-        },
-        {
+        })
+    if "anytls" in enabled:
+        actual.append({
             "name": "02 AnyTLS", "type": "anytls", "server": d, "port": p["anytls"],
             "password": user["anytls_password"], "sni": d, "udp": True,
             "skip-cert-verify": False, "client-fingerprint": "chrome",
-        },
-        {
+        })
+    if "hysteria2" in enabled:
+        actual.append({
             "name": "03 Hysteria2", "type": "hysteria2", "server": d, "port": p["hysteria2"],
             "password": user["hy2_password"], "sni": d, "skip-cert-verify": False,
             "obfs": "salamander", "obfs-password": CONFIG["hy2_obfs_password"],
-        },
-    ]
+        })
     info = [
         {"name": info1, "type": "ss", "server": "127.0.0.1", "port": 1, "cipher": "aes-128-gcm", "password": "info-only"},
         {"name": info2, "type": "ss", "server": "127.0.0.1", "port": 2, "cipher": "aes-128-gcm", "password": "info-only"},
     ]
     names = [item["name"] for item in actual]
+    groups = [{"name": "套餐信息", "type": "select", "proxies": [info1, info2]}]
+    rules = ["MATCH,DIRECT"]
+    if names:
+        groups = [
+            {"name": "节点选择", "type": "select", "proxies": ["自动选择"] + names},
+            {"name": "自动选择", "type": "url-test", "proxies": names, "url": "https://www.gstatic.com/generate_204", "interval": 300},
+        ] + groups
+        rules = ["MATCH,节点选择"]
     config = {
         "mixed-port": 7890,
         "allow-lan": False,
@@ -889,26 +855,26 @@ def mihomo_subscription(user, row):
         "log-level": "info",
         "ipv6": True,
         "proxies": info + actual,
-        "proxy-groups": [
-            {"name": "节点选择", "type": "select", "proxies": ["自动选择"] + names},
-            {"name": "自动选择", "type": "url-test", "proxies": names, "url": "https://www.gstatic.com/generate_204", "interval": 300},
-            {"name": "套餐信息", "type": "select", "proxies": [info1, info2]},
-        ],
-        "rules": ["MATCH,节点选择"],
+        "proxy-groups": groups,
+        "rules": rules,
     }
     return yaml.safe_dump(config, allow_unicode=True, sort_keys=False)
 
 def quanx_subscription(user, row):
     d = CONFIG["domain"]
     p = CONFIG["ports"]
+    enabled = set(CONFIG.get("enabled_protocols", p))
     info1, info2 = status_names(user, row)
     lines = [
         f"shadowsocks=127.0.0.1:1, method=aes-128-gcm, password=info-only, udp-relay=false, tag={info1}",
         f"shadowsocks=127.0.0.1:2, method=aes-128-gcm, password=info-only, udp-relay=false, tag={info2}",
-        f"vless={d}:{p['reality']}, method=none, password={user['vless_reality_uuid']}, obfs=over-tls, obfs-host={CONFIG['reality_server']}, reality-base64-pubkey={CONFIG['reality_public_key']}, reality-hex-shortid={CONFIG['reality_short_id']}, vless-flow=xtls-rprx-vision, udp-relay=true, tag=01 VLESS-REALITY",
-        f"anytls={d}:{p['anytls']}, password={user['anytls_password']}, over-tls=true, tls-host={d}, tls-verification=true, udp-relay=true, tag=02 AnyTLS",
-        "shadowsocks=127.0.0.1:3, method=aes-128-gcm, password=unsupported, udp-relay=false, tag=03 Hysteria2（QuanX不支持）",
     ]
+    if "reality" in enabled:
+        lines.append(f"vless={d}:{p['reality']}, method=none, password={user['vless_reality_uuid']}, obfs=over-tls, obfs-host={CONFIG['reality_server']}, reality-base64-pubkey={CONFIG['reality_public_key']}, reality-hex-shortid={CONFIG['reality_short_id']}, vless-flow=xtls-rprx-vision, udp-relay=true, tag=01 VLESS-REALITY")
+    if "anytls" in enabled:
+        lines.append(f"anytls={d}:{p['anytls']}, password={user['anytls_password']}, over-tls=true, tls-host={d}, tls-verification=true, udp-relay=true, tag=02 AnyTLS")
+    if "hysteria2" in enabled:
+        lines.append("shadowsocks=127.0.0.1:3, method=aes-128-gcm, password=unsupported, udp-relay=false, tag=03 Hysteria2（QuanX不支持）")
     return "\n".join(lines) + "\n"
 
 class Handler(BaseHTTPRequestHandler):
@@ -953,7 +919,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.send_header("Subscription-Userinfo", f"upload={row['upload']}; download={row['download']}; total={quota}; expire={expire_ts}")
         self.send_header("Profile-Update-Interval", "1")
-        self.send_header("Profile-Title", f"Personal-3Protocol-{user['label']}")
+        self.send_header("Profile-Title", f"ST-SB-{user['label']}")
         self.end_headers()
         if send_body:
             self.wfile.write(payload)
@@ -1096,16 +1062,20 @@ class ProxyUserManager:
         self.billing_timezone = ZoneInfo(self.manager_config.get("billing_timezone", self.manager_config["timezone"]))
         self.singbox_binary = self.manager_config["singbox_binary"]
 
-    @staticmethod
-    def create_credentials(values):
-        return {
+    def create_credentials(self, values):
+        user = {
             **values,
             "label": values["name"],
             "token": secrets.token_hex(32),
-            "vless_reality_uuid": str(uuid.uuid4()),
-            "anytls_password": secrets.token_hex(16),
-            "hy2_password": secrets.token_hex(16),
         }
+        enabled = set(self.manager_config.get("enabled_protocols", self.manager_config["ports"]))
+        if "reality" in enabled:
+            user["vless_reality_uuid"] = str(uuid.uuid4())
+        if "anytls" in enabled:
+            user["anytls_password"] = secrets.token_hex(16)
+        if "hysteria2" in enabled:
+            user["hy2_password"] = secrets.token_hex(16)
+        return user
 
     def ensure_unique(self, name):
         if any(user["name"] == name for user in self.manager_config["users"]):
@@ -1116,6 +1086,7 @@ class ProxyUserManager:
         users = config["users"]
         domain = config["domain"]
         ports = config["ports"]
+        enabled = set(config.get("enabled_protocols", ports))
         tls = {
             "enabled": True,
             "server_name": domain,
@@ -1123,8 +1094,9 @@ class ProxyUserManager:
             "certificate_path": f"/etc/letsencrypt/live/{domain}/fullchain.pem",
             "key_path": f"/etc/letsencrypt/live/{domain}/privkey.pem",
         }
-        inbounds = [
-            {
+        inbounds = []
+        if "reality" in enabled:
+            inbounds.append({
                 "type": "vless", "tag": "vless-reality-in", "listen": "0.0.0.0",
                 "listen_port": ports["reality"],
                 "users": [{"name": u["name"], "uuid": u["vless_reality_uuid"], "flow": "xtls-rprx-vision"} for u in users],
@@ -1138,14 +1110,16 @@ class ProxyUserManager:
                         "short_id": [config["reality_short_id"]],
                     },
                 },
-            },
-            {
+            })
+        if "anytls" in enabled:
+            inbounds.append({
                 "type": "anytls", "tag": "anytls-in", "listen": "0.0.0.0",
                 "listen_port": ports["anytls"],
                 "users": [{"name": u["name"], "password": u["anytls_password"]} for u in users],
                 "tls": tls,
-            },
-            {
+            })
+        if "hysteria2" in enabled:
+            inbounds.append({
                 "type": "hysteria2", "tag": "hysteria2-in", "listen": "0.0.0.0",
                 "listen_port": ports["hysteria2"],
                 "up_mbps": config["bandwidth_mbps"], "down_mbps": config["bandwidth_mbps"],
@@ -1157,8 +1131,7 @@ class ProxyUserManager:
                     "headers": {"content-type": "text/html; charset=utf-8"},
                     "content": "<html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>",
                 },
-            },
-        ]
+            })
         outbounds = [{"type": "direct", "tag": "direct-out"}] + [
             {"type": "direct", "tag": f"audit-{user['name']}-out"} for user in users
         ]
@@ -1272,6 +1245,8 @@ def main():
     with LOCK_PATH.open("w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         manager = ProxyUserManager()
+        if not manager.manager_config.get("enabled_protocols", manager.manager_config["ports"]):
+            raise SystemExit("尚未启用代理协议，请先运行 proxy-protocol。")
         try:
             values = UserInput().read(
                 manager.billing_timezone,
@@ -1295,6 +1270,208 @@ if __name__ == "__main__":
     main()
 PY
 chmod 700 /usr/local/sbin/proxy-user-add
+
+cat > /usr/local/sbin/proxy-protocol <<'PY'
+#!/usr/bin/env python3
+import fcntl
+import os
+import re
+import runpy
+import secrets
+import shutil
+import socket
+import subprocess
+import uuid
+from pathlib import Path
+
+MANAGER_CONFIG_PATH = Path("/etc/proxy-manager/config.json")
+SINGBOX_CONFIG_PATH = Path("/etc/sing-box/config.json")
+LOCK_PATH = Path("/var/lib/proxy-manager/user-admin.lock")
+PROTOCOLS = {
+    "1": ("reality", "VLESS + REALITY", "tcp", "VLESS REALITY"),
+    "2": ("anytls", "AnyTLS", "tcp", "AnyTLS"),
+    "3": ("hysteria2", "Hysteria2", "udp", "Hysteria2"),
+}
+
+
+class ProtocolManager:
+    def __init__(self):
+        namespace = runpy.run_path("/usr/local/sbin/proxy-user-add", run_name="proxy_user_module")
+        self.user_manager = namespace["ProxyUserManager"]()
+        self.config = self.user_manager.manager_config
+        self.enabled = list(self.config.get("enabled_protocols", self.config["ports"].keys()))
+        self.config["enabled_protocols"] = self.enabled
+
+    def show(self):
+        print("\n已启用协议：")
+        if not self.enabled:
+            print("  暂无")
+        for key, name, network, _comment in PROTOCOLS.values():
+            if key in self.enabled:
+                print(f"  {name:<16} {self.config['ports'][key]}/{network.upper()}")
+        print("\n可添加协议：")
+        for choice, (key, name, _network, _comment) in PROTOCOLS.items():
+            state = "已启用" if key in self.enabled else "可添加"
+            print(f"  {choice}. {name:<16} {state}")
+        print("  0. 返回")
+
+    def choose(self):
+        self.show()
+        choice = input("请选择 [0-3]: ").strip()
+        if choice == "0":
+            return None
+        if choice not in PROTOCOLS:
+            raise ValueError("请选择 0-3")
+        protocol = PROTOCOLS[choice]
+        if protocol[0] in self.enabled:
+            raise ValueError(f"{protocol[1]} 已经启用")
+        return protocol
+
+    def random_port(self):
+        used = {80, 443, 8080, 8787, int(self.config["ssh_port"]), *self.config["ports"].values()}
+        for _ in range(1000):
+            port = secrets.randbelow(40001) + 20000
+            if port in used:
+                continue
+            sockets = [
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM),
+                socket.socket(socket.AF_INET, socket.SOCK_DGRAM),
+            ]
+            try:
+                for item in sockets:
+                    item.bind(("0.0.0.0", port))
+            except OSError:
+                continue
+            finally:
+                for item in sockets:
+                    item.close()
+            return port
+        raise RuntimeError("无法生成空闲随机端口")
+
+    def add_credentials(self, key):
+        if key == "reality":
+            result = subprocess.check_output(
+                [self.user_manager.singbox_binary, "generate", "reality-keypair"],
+                text=True,
+            )
+            private_match = re.search(r"PrivateKey:\s*(\S+)", result, re.I)
+            public_match = re.search(r"PublicKey:\s*(\S+)", result, re.I)
+            if not private_match or not public_match:
+                raise RuntimeError("REALITY 密钥生成失败")
+            self.config["reality_private_key"] = private_match.group(1)
+            self.config["reality_public_key"] = public_match.group(1)
+            self.config["reality_short_id"] = secrets.token_hex(8)
+            self.config["reality_server"] = "www.cloudflare.com"
+            for user in self.config["users"]:
+                user["vless_reality_uuid"] = str(uuid.uuid4())
+        elif key == "anytls":
+            for user in self.config["users"]:
+                user["anytls_password"] = secrets.token_hex(16)
+        elif key == "hysteria2":
+            self.config["hy2_obfs_password"] = secrets.token_hex(16)
+            for user in self.config["users"]:
+                user["hy2_password"] = secrets.token_hex(16)
+
+    @staticmethod
+    def service_active(service):
+        return subprocess.run(
+            ["systemctl", "is-active", "--quiet", service],
+            check=False,
+        ).returncode == 0
+
+    def refresh_node_info(self):
+        path = Path("/root/node-info.txt")
+        if not path.exists():
+            return
+        protocol_names = {item[1] for item in PROTOCOLS.values()}
+        lines = [
+            line for line in path.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("代理协议端口:")
+            and not any(line.endswith(name) for name in protocol_names)
+        ]
+        insert_at = next(
+            (index + 1 for index, line in enumerate(lines) if line.startswith("TCP 443")),
+            len(lines),
+        )
+        protocol_lines = ["代理协议端口:"]
+        for key, name, network, _comment in PROTOCOLS.values():
+            if key in self.enabled:
+                protocol_lines.append(f"{network.upper():<7} {self.config['ports'][key]:<5} {name}")
+        lines[insert_at:insert_at] = protocol_lines
+        temp_path = path.with_suffix(".txt.protocol-temp")
+        temp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, path)
+
+    def apply(self, protocol):
+        key, name, network, comment = protocol
+        port = self.random_port()
+        self.config["ports"][key] = port
+        self.add_credentials(key)
+        self.enabled.append(key)
+        singbox_config = self.user_manager.build_singbox_config()
+        self.user_manager.validate_singbox(singbox_config)
+        manager_backup = MANAGER_CONFIG_PATH.with_suffix(".json.protocol-backup")
+        singbox_backup = SINGBOX_CONFIG_PATH.with_suffix(".json.protocol-backup")
+        service_state = {
+            "sing-box": self.service_active("sing-box"),
+            "proxy-manager": self.service_active("proxy-manager"),
+        }
+        firewall_added = False
+        try:
+            shutil.copy2(MANAGER_CONFIG_PATH, manager_backup)
+            shutil.copy2(SINGBOX_CONFIG_PATH, singbox_backup)
+            if service_state["proxy-manager"]:
+                subprocess.run(["systemctl", "stop", "proxy-manager"], check=True, timeout=30)
+            self.user_manager.write_atomic(MANAGER_CONFIG_PATH, self.config)
+            self.user_manager.write_atomic(SINGBOX_CONFIG_PATH, singbox_config)
+            subprocess.run(["ufw", "allow", f"{port}/{network}", "comment", comment], check=True)
+            firewall_added = True
+            if service_state["sing-box"]:
+                subprocess.run(["systemctl", "restart", "sing-box"], check=True, timeout=30)
+            if service_state["proxy-manager"]:
+                subprocess.run(["systemctl", "start", "proxy-manager"], check=True, timeout=30)
+        except Exception:
+            shutil.copy2(manager_backup, MANAGER_CONFIG_PATH)
+            shutil.copy2(singbox_backup, SINGBOX_CONFIG_PATH)
+            if firewall_added:
+                subprocess.run(["ufw", "--force", "delete", "allow", f"{port}/{network}"], check=False)
+            if service_state["sing-box"]:
+                subprocess.run(["systemctl", "restart", "sing-box"], check=False)
+            if service_state["proxy-manager"]:
+                subprocess.run(["systemctl", "start", "proxy-manager"], check=False)
+            raise
+        finally:
+            manager_backup.unlink(missing_ok=True)
+            singbox_backup.unlink(missing_ok=True)
+        try:
+            self.refresh_node_info()
+        except OSError as exc:
+            print(f"警告：节点信息文件更新失败：{exc}")
+        print(f"已启用 {name}：{port}/{network.upper()}")
+        if self.config["users"]:
+            print("已有用户的订阅地址不变，刷新订阅即可获取新协议。")
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit("请使用 root 运行：sudo proxy-protocol")
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        manager = ProtocolManager()
+        try:
+            protocol = manager.choose()
+            if protocol is not None:
+                manager.apply(protocol)
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise SystemExit(f"协议操作失败：{exc}") from exc
+
+
+if __name__ == "__main__":
+    main()
+PY
+chmod 700 /usr/local/sbin/proxy-protocol
 
 cat > /usr/local/sbin/proxy <<'EOF'
 #!/usr/bin/env bash
@@ -1321,17 +1498,22 @@ show_menu() {
 ╔──────────────────────────────────╗
 │           代理节点管理           │
 ├──────────────────────────────────┤
-│  1. 新增用户                     │
-│  2. 用户状态                     │
-│  3. 访问记录                     │
-│  4. 访问汇总                     │
-│  5. 配置检查                     │
-│  6. 服务状态                     │
-│  7. 服务日志                     │
-│  8. 防火墙                       │
-│  9. 节点信息                     │
+│  1. 协议管理                     │
+│  2. 新增用户                     │
+│  3. 用户状态                     │
+│  4. 访问记录                     │
+│  5. 访问汇总                     │
+│  6. 配置检查                     │
+│  7. 服务状态                     │
+│  8. 服务日志                     │
+│  9. 防火墙                       │
+│ 10. 节点信息                     │
 │  0. 退出                         │
 ╚──────────────────────────────────╝"
+}
+
+manage_protocols() {
+  proxy-protocol
 }
 
 add_user() {
@@ -1378,24 +1560,25 @@ show_node_info() {
 
 while true; do
   show_menu
-  read -r -p "请选择 [0-9]: " choice
+  read -r -p "请选择 [0-10]: " choice
   echo
   case "$choice" in
-    1) add_user ;;
-    2) show_users ;;
-    3) show_recent_audit ;;
-    4) show_audit_summary ;;
-    5) check_singbox_config ;;
-    6) show_service_status ;;
-    7) show_service_logs ;;
-    8) show_firewall ;;
-    9) show_node_info ;;
+    1) manage_protocols ;;
+    2) add_user ;;
+    3) show_users ;;
+    4) show_recent_audit ;;
+    5) show_audit_summary ;;
+    6) check_singbox_config ;;
+    7) show_service_status ;;
+    8) show_service_logs ;;
+    9) show_firewall ;;
+    10) show_node_info ;;
     0)
       echo "已退出代理节点管理。"
       exit 0
       ;;
     *)
-      echo "无效选择，请输入 0-9。"
+      echo "无效选择，请输入 0-10。"
       ;;
   esac
   pause_menu
@@ -1418,10 +1601,12 @@ from pathlib import Path
 
 SOURCE_URL = "https://raw.githubusercontent.com/ShumTin/st-sb-manager/master/install.sh"
 LOCK_PATH = Path("/run/lock/proxy-manager-install.lock")
+ADMIN_LOCK_PATH = Path("/var/lib/proxy-manager/user-admin.lock")
 TARGETS = (
     Path("/opt/proxy-manager/manager.py"),
     Path("/opt/proxy-manager/audit_supervisor.py"),
     Path("/usr/local/sbin/proxy-user-add"),
+    Path("/usr/local/sbin/proxy-protocol"),
     Path("/usr/local/sbin/proxy"),
     Path("/usr/local/sbin/proxy-update"),
     Path("/usr/local/sbin/proxy-user-status"),
@@ -1569,9 +1754,11 @@ def main():
     if os.geteuid() != 0:
         raise SystemExit("请使用 root 运行：sudo proxy-update")
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with LOCK_PATH.open("w") as lock_file:
+    ADMIN_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("w") as lock_file, ADMIN_LOCK_PATH.open("w") as admin_lock_file:
         try:
             fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(admin_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise SystemExit("安装或更新程序正在运行，请稍后重试。") from exc
         try:
@@ -2061,6 +2248,7 @@ python3 -m py_compile \
   /opt/proxy-manager/manager.py \
   /opt/proxy-manager/audit_supervisor.py \
   /usr/local/sbin/proxy-user-add \
+  /usr/local/sbin/proxy-protocol \
   /usr/local/sbin/proxy-update \
   /usr/local/sbin/proxy-user-status \
   /usr/local/sbin/proxy-audit
@@ -2087,35 +2275,21 @@ if ! systemctl is-active --quiet proxy-manager; then
   exit 1
 fi
 
-mapfile -t PORT_VALUES < <(python3 - <<'PY'
-import json
-cfg = json.load(open('/etc/proxy-manager/config.json'))
-for key in ('reality','anytls','hysteria2'):
-    print(cfg['ports'][key])
-PY
-)
-REALITY_PORT=${PORT_VALUES[0]}
-ANYTLS_PORT=${PORT_VALUES[1]}
-HY2_PORT=${PORT_VALUES[2]}
-
 echo "正在配置 UFW；将先放行当前 SSH 端口 ${SSH_PORT}/TCP……"
 ufw allow "${SSH_PORT}/tcp" comment 'SSH - do not delete'
-if [[ -n "$OLD_REALITY_PORT" && "$OLD_REALITY_PORT" != "$REALITY_PORT" ]]; then
+if [[ -n "$OLD_REALITY_PORT" ]]; then
   ufw --force delete allow "${OLD_REALITY_PORT}/tcp" || true
 fi
-if [[ -n "$OLD_ANYTLS_PORT" && "$OLD_ANYTLS_PORT" != "$ANYTLS_PORT" ]]; then
+if [[ -n "$OLD_ANYTLS_PORT" ]]; then
   ufw --force delete allow "${OLD_ANYTLS_PORT}/tcp" || true
 fi
-if [[ -n "$OLD_HY2_PORT" && "$OLD_HY2_PORT" != "$HY2_PORT" ]]; then
+if [[ -n "$OLD_HY2_PORT" ]]; then
   ufw --force delete allow "${OLD_HY2_PORT}/udp" || true
 fi
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 80/tcp comment 'ACME HTTP'
 ufw allow 443/tcp comment 'HTTPS subscription'
-ufw allow "${REALITY_PORT}/tcp" comment 'VLESS REALITY'
-ufw allow "${ANYTLS_PORT}/tcp" comment 'AnyTLS'
-ufw allow "${HY2_PORT}/udp" comment 'Hysteria2'
 ufw --force enable
 
 if ! ufw status | grep -q '^Status: active'; then
@@ -2142,7 +2316,7 @@ print_colored_node_info() {
   local line
   while IFS= read -r line; do
     case "$line" in
-      "云服务商安全组需要放行："|"日常管理命令："|"格式强制参数（通常无需使用）："|"审计查询命令：")
+      "云服务商安全组需要放行："|"代理协议端口: "*|"日常管理命令："|"格式强制参数（通常无需使用）："|"审计查询命令：")
         printf '%b%s%b\n' "$COLOR_YELLOW" "$line" "$COLOR_RESET"
         ;;
       "域名: "*|"搬瓦工下次流量重置: "*|"SSH端口: "*)
@@ -2167,5 +2341,6 @@ print_colored_node_info
 echo
 printf '%b下一步%b\n' "$COLOR_YELLOW" "$COLOR_RESET"
 printf '  1. 运行 %bproxy%b 打开管理菜单\n' "$COLOR_CYAN" "$COLOR_RESET"
-printf '  2. 选择 %b1. 新增用户%b 创建首个订阅\n' "$COLOR_CYAN" "$COLOR_RESET"
-printf '  3. 完整安装信息保存在 %b/root/node-info.txt%b\n' "$COLOR_CYAN" "$COLOR_RESET"
+printf '  2. 选择 %b1. 协议管理%b，逐个启用所需协议\n' "$COLOR_CYAN" "$COLOR_RESET"
+printf '  3. 选择 %b2. 新增用户%b 创建首个订阅\n' "$COLOR_CYAN" "$COLOR_RESET"
+printf '  4. 完整安装信息保存在 %b/root/node-info.txt%b\n' "$COLOR_CYAN" "$COLOR_RESET"
