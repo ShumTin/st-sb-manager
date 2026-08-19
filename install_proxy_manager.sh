@@ -21,7 +21,6 @@ INSTALL_SUCCEEDED=0
 SING_BOX_WAS_ACTIVE=0
 PROXY_MANAGER_WAS_ACTIVE=0
 cleanup() {
-  local exit_code=$?
   if [[ "$TEMP_SWAP" == "1" ]] && swapon --show=NAME --noheadings | grep -qx '/swapfile-proxy-build'; then
     swapoff /swapfile-proxy-build || true
   fi
@@ -39,10 +38,24 @@ cleanup() {
       systemctl start proxy-manager >/dev/null 2>&1 || true
     fi
   fi
-  return "$exit_code"
 }
-trap cleanup EXIT
+
+on_exit() {
+  local exit_code=$?
+  trap - EXIT ERR
+  cleanup
+  exit "$exit_code"
+}
+
+trap on_exit EXIT
 trap 'echo "安装在第 ${LINENO} 行失败，请保留终端报错信息。" >&2' ERR
+
+trim_input() {
+  local value=${1//$'\r'/}
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  printf '%s' "$value"
+}
 
 echo "=== 三协议动态用户管理 + 独立流量/到期策略 + 7天域名审计安装程序 ==="
 echo "协议：VLESS+REALITY、AnyTLS、Hysteria2"
@@ -51,6 +64,9 @@ echo
 read -r -p "请输入节点域名（例如 node.example.com）: " DOMAIN
 read -r -p "请输入用于 Let's Encrypt 的真实邮箱: " EMAIL
 read -r -p "请输入 VPS 标称带宽 Mbps（1 Gbps 填 1000，直接回车默认 1000）: " BANDWIDTH
+DOMAIN=$(trim_input "$DOMAIN")
+EMAIL=$(trim_input "$EMAIL")
+BANDWIDTH=$(trim_input "$BANDWIDTH")
 BANDWIDTH=${BANDWIDTH:-1000}
 DETECTED_SSH_PORT=""
 if [[ -n "${SSH_CONNECTION:-}" ]]; then
@@ -63,13 +79,16 @@ if [[ ! "$DETECTED_SSH_PORT" =~ ^[0-9]+$ ]]; then
   DETECTED_SSH_PORT=22
 fi
 read -r -p "请输入 SSH 端口（已自动识别为 ${DETECTED_SSH_PORT}，直接回车采用）: " SSH_PORT
+SSH_PORT=$(trim_input "$SSH_PORT")
 SSH_PORT=${SSH_PORT:-$DETECTED_SSH_PORT}
 echo
 echo "可从 KiwiVM API 获取搬瓦工精确流量重置时间；API Key 仅用于本次查询，不会保存。"
 read -r -p "请输入 KiwiVM VEID（直接回车跳过自动同步）: " KIWIVM_VEID
+KIWIVM_VEID=$(trim_input "$KIWIVM_VEID")
 KIWIVM_API_KEY=""
 if [[ -n "$KIWIVM_VEID" ]]; then
   read -r -s -p "请输入 KiwiVM API Key: " KIWIVM_API_KEY
+  KIWIVM_API_KEY=${KIWIVM_API_KEY//$'\r'/}
   echo
 fi
 
