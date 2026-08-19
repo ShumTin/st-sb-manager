@@ -1941,16 +1941,47 @@ fi
 
 INSTALL_SUCCEEDED=1
 
+COLOR_GREEN=""
+COLOR_YELLOW=""
+COLOR_CYAN=""
+COLOR_RED=""
+COLOR_RESET=""
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  COLOR_GREEN=$'\033[1;32m'
+  COLOR_YELLOW=$'\033[1;33m'
+  COLOR_CYAN=$'\033[1;36m'
+  COLOR_RED=$'\033[1;31m'
+  COLOR_RESET=$'\033[0m'
+fi
+
+print_colored_node_info() {
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      "云服务商安全组需要放行："|"日常管理命令："|"格式强制参数（通常无需使用）："|"审计查询命令：")
+        printf '%b%s%b\n' "$COLOR_YELLOW" "$line" "$COLOR_RESET"
+        ;;
+      "域名: "*|"搬瓦工下次流量重置: "*|"SSH端口: "*)
+        printf '%b%s%b\n' "$COLOR_GREEN" "$line" "$COLOR_RESET"
+        ;;
+      TCP*|UDP*|proxy*|\?target=*)
+        printf '%b%s%b\n' "$COLOR_CYAN" "$line" "$COLOR_RESET"
+        ;;
+      "请明确告知所有使用者已启用域名/IP级访问审计。"|"严禁把 /etc/proxy-manager/config.json 发给他人，其中包含全部服务端密钥。")
+        printf '%b%s%b\n' "$COLOR_RED" "$line" "$COLOR_RESET"
+        ;;
+      *)
+        printf '%s\n' "$line"
+        ;;
+    esac
+  done < /root/node-info.txt
+}
+
 echo
-echo "=== 安装完成 ==="
-cat /root/node-info.txt
+printf '%b=== 安装完成 ===%b\n' "$COLOR_GREEN" "$COLOR_RESET"
+print_colored_node_info
 echo
-echo "打开交互式管理菜单：proxy"
-echo "也可直接新增用户：proxy-user-add"
-echo "也可直接查看用户状态：proxy-user-status"
-echo "查看最近24小时访问：proxy-audit"
-echo "查看7天访问汇总：proxy-audit --summary --days 7"
-echo "查看服务状态：systemctl status sing-box proxy-manager --no-pager"
-echo "查看防火墙规则：ufw status numbered"
-echo "完整信息文件：/root/node-info.txt"
-echo "安装时不会预建用户，请现在运行 proxy 并选择 1 新增用户。"
+printf '%b下一步%b\n' "$COLOR_YELLOW" "$COLOR_RESET"
+printf '  1. 运行 %bproxy%b 打开管理菜单\n' "$COLOR_CYAN" "$COLOR_RESET"
+printf '  2. 选择 %b1. 新增用户%b 创建首个订阅\n' "$COLOR_CYAN" "$COLOR_RESET"
+printf '  3. 完整安装信息保存在 %b/root/node-info.txt%b\n' "$COLOR_CYAN" "$COLOR_RESET"
