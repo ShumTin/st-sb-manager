@@ -1741,15 +1741,14 @@ show_menu() {
 │  1. 协议管理                     │
 │  2. 新增用户                     │
 │  3. 用户状态                     │
-│  4. 访问记录                     │
-│  5. 访问汇总                     │
-│  6. 配置检查                     │
-│  7. 服务状态                     │
-│  8. 服务日志                     │
-│  9. 防火墙                       │
-│ 10. 节点信息                     │
-│ 11. 更新版本                     │
-│ 12. 卸载                         │
+│  4. 访问审计                     │
+│  5. 配置检查                     │
+│  6. 服务状态                     │
+│  7. 服务日志                     │
+│  8. 防火墙                       │
+│  9. 节点信息                     │
+│ 10. 更新版本                     │
+│ 11. 卸载                         │
 │  0. 退出                         │
 ╚──────────────────────────────────╝"
 }
@@ -1774,10 +1773,35 @@ show_audit_summary() {
   proxy-audit --summary --days 7
 }
 
+manage_audit() {
+  local choice
+  echo "
+╔──────────────────────────────────╗
+│             访问审计             │
+├──────────────────────────────────┤
+│  1. 访问记录                     │
+│  2. 访问汇总                     │
+│  0. 返回                         │
+╚──────────────────────────────────╝"
+  read -r -p "请选择 [0-2]: " choice
+  echo
+  case "$choice" in
+    1) show_recent_audit ;;
+    2) show_audit_summary ;;
+    0) return ;;
+    *) echo "无效选择，请输入 0-2。" ;;
+  esac
+}
+
 check_singbox_config() {
   local binary
   binary=$(python3 -c "import json; print(json.load(open('/etc/proxy-manager/config.json'))['singbox_binary'])")
-  "$binary" check -c /etc/sing-box/config.json
+  if "$binary" check -c /etc/sing-box/config.json; then
+    echo "配置检查通过，sing-box 配置有效。"
+  else
+    echo "配置检查失败，请根据上方错误信息修复。" >&2
+    return 1
+  fi
 }
 
 show_service_status() {
@@ -1942,27 +1966,26 @@ PY
 
 while true; do
   show_menu
-  read -r -p "请选择 [0-12]: " choice
+  read -r -p "请选择 [0-11]: " choice
   echo
   case "$choice" in
     1) manage_protocols ;;
     2) add_user ;;
     3) show_users ;;
-    4) show_recent_audit ;;
-    5) show_audit_summary ;;
-    6) check_singbox_config ;;
-    7) show_service_status ;;
-    8) show_service_logs ;;
-    9) show_firewall ;;
-    10) show_node_info ;;
-    11) update_proxy ;;
-    12) uninstall_proxy ;;
+    4) manage_audit ;;
+    5) check_singbox_config ;;
+    6) show_service_status ;;
+    7) show_service_logs ;;
+    8) show_firewall ;;
+    9) show_node_info ;;
+    10) update_proxy ;;
+    11) uninstall_proxy ;;
     0)
       echo "已退出代理节点管理。"
       exit 0
       ;;
     *)
-      echo "无效选择，请输入 0-12。"
+      echo "无效选择，请输入 0-11。"
       ;;
   esac
   pause_menu
