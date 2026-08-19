@@ -68,8 +68,8 @@ show_install_logo() {
 
 show_install_logo
 echo
-echo "=== 三协议动态用户管理 + 独立流量/到期策略 + 7天域名审计安装程序 ==="
-echo "协议：安装后按需启用 VLESS+REALITY、AnyTLS、Hysteria2"
+echo "=== 六协议动态用户管理 + 独立流量/到期策略 + 7天域名审计安装程序 ==="
+echo "协议：安装后按需启用 VLESS+REALITY、AnyTLS、Hysteria2、Shadowsocks 2022、TUIC v5、Trojan TLS"
 echo "说明：首次安装不启用代理协议；重新安装会使旧订阅失效。"
 echo
 read -r -p "请输入节点域名（例如 node.example.com）: " DOMAIN
@@ -150,6 +150,9 @@ done
 OLD_REALITY_PORT=""
 OLD_ANYTLS_PORT=""
 OLD_HY2_PORT=""
+OLD_SS2022_PORT=""
+OLD_TUIC_PORT=""
+OLD_TROJAN_PORT=""
 if [[ -f /etc/proxy-manager/config.json ]]; then
   mapfile -t OLD_PORT_VALUES < <(python3 - <<'PY' || true
 import json
@@ -157,16 +160,19 @@ import json
 try:
     with open("/etc/proxy-manager/config.json", encoding="utf-8") as handle:
         ports = json.load(handle)["ports"]
-    for name in ("reality", "anytls", "hysteria2"):
+    for name in ("reality", "anytls", "hysteria2", "shadowsocks2022", "tuic", "trojan"):
         print(ports.get(name, ""))
 except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
     pass
 PY
   )
-  if (( ${#OLD_PORT_VALUES[@]} == 3 )); then
+  if (( ${#OLD_PORT_VALUES[@]} == 6 )); then
     OLD_REALITY_PORT=${OLD_PORT_VALUES[0]}
     OLD_ANYTLS_PORT=${OLD_PORT_VALUES[1]}
     OLD_HY2_PORT=${OLD_PORT_VALUES[2]}
+    OLD_SS2022_PORT=${OLD_PORT_VALUES[3]}
+    OLD_TUIC_PORT=${OLD_PORT_VALUES[4]}
+    OLD_TROJAN_PORT=${OLD_PORT_VALUES[5]}
   fi
 fi
 
@@ -801,6 +807,16 @@ def uri_links(user, row):
         links.append(f"anytls://{quote(user['anytls_password'], safe='')}@{d}:{p['anytls']}?security=tls&sni={d}&fp=chrome&type=tcp#{tag('02 AnyTLS')}")
     if "hysteria2" in enabled:
         links.append(f"hysteria2://{quote(user['hy2_password'], safe='')}@{d}:{p['hysteria2']}/?sni={d}&obfs=salamander&obfs-password={quote(CONFIG['hy2_obfs_password'], safe='')}#{tag('03 Hysteria2')}")
+    if "shadowsocks2022" in enabled:
+        password = f"{CONFIG['ss2022_server_password']}:{user['ss2022_password']}"
+        userinfo = base64.urlsafe_b64encode(
+            f"2022-blake3-aes-128-gcm:{password}".encode()
+        ).decode().rstrip("=")
+        links.append(f"ss://{userinfo}@{d}:{p['shadowsocks2022']}#{tag('04 Shadowsocks 2022')}")
+    if "tuic" in enabled:
+        links.append(f"tuic://{user['tuic_uuid']}:{quote(user['tuic_password'], safe='')}@{d}:{p['tuic']}?sni={d}&alpn=h3&congestion_control=cubic&udp_relay_mode=native#{tag('05 TUIC v5')}")
+    if "trojan" in enabled:
+        links.append(f"trojan://{quote(user['trojan_password'], safe='')}@{d}:{p['trojan']}?security=tls&sni={d}&type=tcp#{tag('06 Trojan TLS')}")
     dummy = "00000000-0000-0000-0000-000000000000"
     links.insert(0, f"vless://{dummy}@127.0.0.1:1?encryption=none&security=none&type=tcp#{tag(name1)}")
     links.insert(1, f"vless://{dummy}@127.0.0.1:2?encryption=none&security=none&type=tcp#{tag(name2)}")
@@ -834,6 +850,26 @@ def mihomo_subscription(user, row):
             "name": "03 Hysteria2", "type": "hysteria2", "server": d, "port": p["hysteria2"],
             "password": user["hy2_password"], "sni": d, "skip-cert-verify": False,
             "obfs": "salamander", "obfs-password": CONFIG["hy2_obfs_password"],
+        })
+    if "shadowsocks2022" in enabled:
+        actual.append({
+            "name": "04 Shadowsocks 2022", "type": "ss", "server": d,
+            "port": p["shadowsocks2022"], "cipher": "2022-blake3-aes-128-gcm",
+            "password": f"{CONFIG['ss2022_server_password']}:{user['ss2022_password']}",
+            "udp": True, "udp-over-tcp": True, "udp-over-tcp-version": 2,
+        })
+    if "tuic" in enabled:
+        actual.append({
+            "name": "05 TUIC v5", "type": "tuic", "server": d, "port": p["tuic"],
+            "uuid": user["tuic_uuid"], "password": user["tuic_password"], "sni": d,
+            "skip-cert-verify": False, "congestion-controller": "cubic",
+            "udp-relay-mode": "native", "reduce-rtt": False,
+        })
+    if "trojan" in enabled:
+        actual.append({
+            "name": "06 Trojan TLS", "type": "trojan", "server": d, "port": p["trojan"],
+            "password": user["trojan_password"], "sni": d, "skip-cert-verify": False,
+            "udp": True, "network": "tcp",
         })
     info = [
         {"name": info1, "type": "ss", "server": "127.0.0.1", "port": 1, "cipher": "aes-128-gcm", "password": "info-only"},
@@ -875,6 +911,12 @@ def quanx_subscription(user, row):
         lines.append(f"anytls={d}:{p['anytls']}, password={user['anytls_password']}, over-tls=true, tls-host={d}, tls-verification=true, udp-relay=true, tag=02 AnyTLS")
     if "hysteria2" in enabled:
         lines.append("shadowsocks=127.0.0.1:3, method=aes-128-gcm, password=unsupported, udp-relay=false, tag=03 Hysteria2（QuanX不支持）")
+    if "shadowsocks2022" in enabled:
+        lines.append("shadowsocks=127.0.0.1:4, method=aes-128-gcm, password=unsupported, udp-relay=false, tag=04 Shadowsocks 2022（QuanX不支持）")
+    if "tuic" in enabled:
+        lines.append("shadowsocks=127.0.0.1:5, method=aes-128-gcm, password=unsupported, udp-relay=false, tag=05 TUIC v5（QuanX不支持）")
+    if "trojan" in enabled:
+        lines.append(f"trojan={d}:{p['trojan']}, password={user['trojan_password']}, over-tls=true, tls-host={d}, tls-verification=true, fast-open=false, udp-relay=true, tag=06 Trojan TLS")
     return "\n".join(lines) + "\n"
 
 class Handler(BaseHTTPRequestHandler):
@@ -939,6 +981,7 @@ chmod 700 /opt/proxy-manager/manager.py
 cat > /usr/local/sbin/proxy-user-add <<'PY'
 #!/usr/bin/env python3
 import argparse
+import base64
 import calendar
 import fcntl
 import json
@@ -1075,6 +1118,13 @@ class ProxyUserManager:
             user["anytls_password"] = secrets.token_hex(16)
         if "hysteria2" in enabled:
             user["hy2_password"] = secrets.token_hex(16)
+        if "shadowsocks2022" in enabled:
+            user["ss2022_password"] = base64.b64encode(secrets.token_bytes(16)).decode()
+        if "tuic" in enabled:
+            user["tuic_uuid"] = str(uuid.uuid4())
+            user["tuic_password"] = secrets.token_hex(16)
+        if "trojan" in enabled:
+            user["trojan_password"] = secrets.token_hex(16)
         return user
 
     def ensure_unique(self, name):
@@ -1131,6 +1181,33 @@ class ProxyUserManager:
                     "headers": {"content-type": "text/html; charset=utf-8"},
                     "content": "<html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>",
                 },
+            })
+        if "shadowsocks2022" in enabled:
+            inbounds.append({
+                "type": "shadowsocks", "tag": "shadowsocks2022-in", "listen": "0.0.0.0",
+                "listen_port": ports["shadowsocks2022"], "network": "tcp",
+                "method": "2022-blake3-aes-128-gcm",
+                "password": config["ss2022_server_password"],
+                "users": [{"name": u["name"], "password": u["ss2022_password"]} for u in users],
+                "multiplex": {"enabled": True},
+            })
+        if "tuic" in enabled:
+            inbounds.append({
+                "type": "tuic", "tag": "tuic-in", "listen": "0.0.0.0",
+                "listen_port": ports["tuic"],
+                "users": [
+                    {"name": u["name"], "uuid": u["tuic_uuid"], "password": u["tuic_password"]}
+                    for u in users
+                ],
+                "congestion_control": "cubic", "zero_rtt_handshake": False,
+                "tls": tls,
+            })
+        if "trojan" in enabled:
+            inbounds.append({
+                "type": "trojan", "tag": "trojan-in", "listen": "0.0.0.0",
+                "listen_port": ports["trojan"],
+                "users": [{"name": u["name"], "password": u["trojan_password"]} for u in users],
+                "tls": tls,
             })
         outbounds = [{"type": "direct", "tag": "direct-out"}] + [
             {"type": "direct", "tag": f"audit-{user['name']}-out"} for user in users
@@ -1273,6 +1350,7 @@ chmod 700 /usr/local/sbin/proxy-user-add
 
 cat > /usr/local/sbin/proxy-protocol <<'PY'
 #!/usr/bin/env python3
+import base64
 import fcntl
 import os
 import re
@@ -1291,6 +1369,9 @@ PROTOCOLS = {
     "1": ("reality", "VLESS + REALITY", "tcp", "VLESS REALITY"),
     "2": ("anytls", "AnyTLS", "tcp", "AnyTLS"),
     "3": ("hysteria2", "Hysteria2", "udp", "Hysteria2"),
+    "4": ("shadowsocks2022", "Shadowsocks 2022", "tcp", "Shadowsocks 2022"),
+    "5": ("tuic", "TUIC v5", "udp", "TUIC v5"),
+    "6": ("trojan", "Trojan TLS", "tcp", "Trojan TLS"),
 }
 
 
@@ -1325,9 +1406,9 @@ class ProtocolManager:
         return choice
 
     def choose_to_add(self):
-        choice = input("请选择要添加的协议 [1-3]: ").strip()
+        choice = input("请选择要添加的协议 [1-6]: ").strip()
         if choice not in PROTOCOLS:
-            raise ValueError("请选择 1-3")
+            raise ValueError("请选择 1-6")
         protocol = PROTOCOLS[choice]
         if protocol[0] in self.enabled:
             raise ValueError(f"{protocol[1]} 已经启用")
@@ -1336,9 +1417,9 @@ class ProtocolManager:
     def choose_to_remove(self):
         if not self.enabled:
             raise ValueError("当前没有已启用的协议")
-        choice = input("请选择要删除的协议 [1-3]: ").strip()
+        choice = input("请选择要删除的协议 [1-6]: ").strip()
         if choice not in PROTOCOLS:
-            raise ValueError("请选择 1-3")
+            raise ValueError("请选择 1-6")
         protocol = PROTOCOLS[choice]
         if protocol[0] not in self.enabled:
             raise ValueError(f"{protocol[1]} 尚未启用")
@@ -1391,6 +1472,17 @@ class ProtocolManager:
             self.config["hy2_obfs_password"] = secrets.token_hex(16)
             for user in self.config["users"]:
                 user["hy2_password"] = secrets.token_hex(16)
+        elif key == "shadowsocks2022":
+            self.config["ss2022_server_password"] = base64.b64encode(secrets.token_bytes(16)).decode()
+            for user in self.config["users"]:
+                user["ss2022_password"] = base64.b64encode(secrets.token_bytes(16)).decode()
+        elif key == "tuic":
+            for user in self.config["users"]:
+                user["tuic_uuid"] = str(uuid.uuid4())
+                user["tuic_password"] = secrets.token_hex(16)
+        elif key == "trojan":
+            for user in self.config["users"]:
+                user["trojan_password"] = secrets.token_hex(16)
 
     def remove_credentials(self, key):
         if key == "reality":
@@ -1407,6 +1499,17 @@ class ProtocolManager:
             self.config.pop("hy2_obfs_password", None)
             for user in self.config["users"]:
                 user.pop("hy2_password", None)
+        elif key == "shadowsocks2022":
+            self.config.pop("ss2022_server_password", None)
+            for user in self.config["users"]:
+                user.pop("ss2022_password", None)
+        elif key == "tuic":
+            for user in self.config["users"]:
+                user.pop("tuic_uuid", None)
+                user.pop("tuic_password", None)
+        elif key == "trojan":
+            for user in self.config["users"]:
+                user.pop("trojan_password", None)
 
     @staticmethod
     def service_active(service):
@@ -1959,6 +2062,9 @@ PROTOCOL_NAMES = {
     "vless-reality-in": "VLESS-REALITY",
     "anytls-in": "AnyTLS",
     "hysteria2-in": "Hysteria2",
+    "shadowsocks2022-in": "Shadowsocks 2022",
+    "tuic-in": "TUIC v5",
+    "trojan-in": "Trojan TLS",
 }
 process = None
 
@@ -2436,6 +2542,15 @@ if [[ -n "$OLD_ANYTLS_PORT" ]]; then
 fi
 if [[ -n "$OLD_HY2_PORT" ]]; then
   ufw --force delete allow "${OLD_HY2_PORT}/udp" || true
+fi
+if [[ -n "$OLD_SS2022_PORT" ]]; then
+  ufw --force delete allow "${OLD_SS2022_PORT}/tcp" || true
+fi
+if [[ -n "$OLD_TUIC_PORT" ]]; then
+  ufw --force delete allow "${OLD_TUIC_PORT}/udp" || true
+fi
+if [[ -n "$OLD_TROJAN_PORT" ]]; then
+  ufw --force delete allow "${OLD_TROJAN_PORT}/tcp" || true
 fi
 ufw default deny incoming
 ufw default allow outgoing
