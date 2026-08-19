@@ -1416,7 +1416,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-SOURCE_URL = "https://raw.githubusercontent.com/ShumTin/st-sb-manager/master/install_proxy_manager.sh"
+SOURCE_URL = "https://raw.githubusercontent.com/ShumTin/st-sb-manager/master/install.sh"
 LOCK_PATH = Path("/run/lock/proxy-manager-install.lock")
 TARGETS = (
     Path("/opt/proxy-manager/manager.py"),

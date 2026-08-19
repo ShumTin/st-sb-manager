@@ -7,15 +7,15 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
-SOURCE_URL="https://raw.githubusercontent.com/ShumTin/st-sb-manager/master/install_proxy_manager.sh"
+SOURCE_URL="https://raw.githubusercontent.com/ShumTin/st-sb-manager/master/install.sh"
 TEMP_DIR=$(mktemp -d)
 cleanup() {
   rm -rf -- "$TEMP_DIR"
 }
 trap cleanup EXIT
 
-curl -fsSL "$SOURCE_URL" -o "$TEMP_DIR/install_proxy_manager.sh"
-python3 - "$TEMP_DIR/install_proxy_manager.sh" "$TEMP_DIR/proxy-update" <<'PY'
+curl -fsSL "$SOURCE_URL" -o "$TEMP_DIR/install.sh"
+python3 - "$TEMP_DIR/install.sh" "$TEMP_DIR/proxy-update" <<'PY'
 import sys
 from pathlib import Path
 
