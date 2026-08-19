@@ -57,6 +57,17 @@ trim_input() {
   printf '%s' "$value"
 }
 
+show_install_logo() {
+  echo '
+   ___________   _____ ____
+  / ___/_  __/  / ___// __ )
+  \__ \ / /_____\__ \/ __  |
+ ___/ // /_____/__/ / /_/ /
+/____//_/     /____/_____/'
+}
+
+show_install_logo
+echo
 echo "=== 三协议动态用户管理 + 独立流量/到期策略 + 7天域名审计安装程序 ==="
 echo "协议：VLESS+REALITY、AnyTLS、Hysteria2"
 echo "说明：安装后使用 proxy-user-add 按需创建用户；重新安装会使旧订阅失效。"
