@@ -1749,6 +1749,7 @@ show_menu() {
 │  9. 防火墙                       │
 │ 10. 节点信息                     │
 │ 11. 更新版本                     │
+│ 12. 卸载                         │
 │  0. 退出                         │
 ╚──────────────────────────────────╝"
 }
@@ -1807,9 +1808,141 @@ update_proxy() {
   proxy-update
 }
 
+uninstall_proxy() {
+  local confirm backup_dir path rule
+  local backup_failed=0
+  local warning_count=0
+  local -a firewall_rules=()
+  echo "此操作将卸载 ST-SB 服务、配置、数据库、管理命令和 nginx 订阅站点。"
+  echo "Let’s Encrypt 证书、sing-box 程序、SSH/80/443 防火墙规则和卸载备份会保留。"
+  read -r -p "请输入 UNINSTALL 确认卸载: " confirm
+  if [[ "$confirm" != "UNINSTALL" ]]; then
+    echo "已取消卸载。"
+    return
+  fi
+
+  exec 8>/run/lock/proxy-manager-install.lock
+  if ! flock -n 8; then
+    echo "安装或更新程序正在运行，请稍后重试。"
+    return
+  fi
+  exec 7>/var/lib/proxy-manager/user-admin.lock
+  if ! flock -n 7; then
+    echo "用户或协议管理程序正在运行，请稍后重试。"
+    return
+  fi
+
+  if ! backup_dir=$(mktemp -d "/root/st-sb-uninstall-backup-$(date +%Y%m%d-%H%M%S).XXXXXX"); then
+    echo "无法创建卸载备份目录，已终止卸载。"
+    return
+  fi
+  chmod 700 "$backup_dir"
+  for path in \
+    /etc/proxy-manager \
+    /etc/sing-box/config.json \
+    /var/lib/proxy-manager \
+    /opt/proxy-manager \
+    /etc/systemd/system/sing-box.service \
+    /etc/systemd/system/proxy-manager.service \
+    /etc/nginx/sites-available/proxy-subscription \
+    /etc/nginx/sites-enabled/proxy-subscription \
+    /etc/letsencrypt/renewal-hooks/deploy/reload-proxy-services \
+    /usr/local/sbin/proxy \
+    /usr/local/sbin/proxy-protocol \
+    /usr/local/sbin/proxy-node-info \
+    /usr/local/sbin/proxy-update \
+    /usr/local/sbin/proxy-user-add \
+    /usr/local/sbin/proxy-user-status \
+    /usr/local/sbin/proxy-audit \
+    /root/node-info.txt \
+    /root/proxy-links.txt; do
+    if [[ -e "$path" || -L "$path" ]]; then
+      if ! cp -a --parents "$path" "$backup_dir"; then
+        backup_failed=1
+      fi
+    fi
+  done
+  if (( backup_failed )); then
+    echo "卸载备份不完整，已终止卸载：$backup_dir"
+    return
+  fi
+
+  if [[ -r /etc/proxy-manager/config.json ]]; then
+    mapfile -t firewall_rules < <(python3 <<'PY'
+import json
+
+networks = {
+    "reality": "tcp",
+    "anytls": "tcp",
+    "hysteria2": "udp",
+    "shadowsocks2022": "tcp",
+    "tuic": "udp",
+    "trojan": "tcp",
+}
+try:
+    with open("/etc/proxy-manager/config.json", encoding="utf-8") as handle:
+        ports = json.load(handle).get("ports", {})
+    for name, network in networks.items():
+        port = ports.get(name)
+        if isinstance(port, int) and 1 <= port <= 65535:
+            print(f"{port}/{network}")
+except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    pass
+PY
+    )
+  fi
+
+  if ! systemctl stop proxy-manager sing-box; then
+    echo "服务停止失败，已终止卸载；备份位于：$backup_dir"
+    return
+  fi
+  systemctl disable proxy-manager sing-box >/dev/null 2>&1 || warning_count=$((warning_count + 1))
+  for rule in "${firewall_rules[@]}"; do
+    ufw --force delete allow "$rule" >/dev/null 2>&1 || warning_count=$((warning_count + 1))
+  done
+
+  if ! rm -f \
+    /etc/systemd/system/sing-box.service \
+    /etc/systemd/system/proxy-manager.service \
+    /etc/nginx/sites-enabled/proxy-subscription \
+    /etc/nginx/sites-available/proxy-subscription \
+    /etc/letsencrypt/renewal-hooks/deploy/reload-proxy-services \
+    /etc/sing-box/config.json \
+    /usr/local/sbin/proxy \
+    /usr/local/sbin/proxy-protocol \
+    /usr/local/sbin/proxy-node-info \
+    /usr/local/sbin/proxy-update \
+    /usr/local/sbin/proxy-user-add \
+    /usr/local/sbin/proxy-user-status \
+    /usr/local/sbin/proxy-audit \
+    /root/node-info.txt \
+    /root/proxy-links.txt; then
+    echo "部分文件删除失败，请根据备份手动检查：$backup_dir"
+    return
+  fi
+  if ! rm -rf -- /etc/proxy-manager /var/lib/proxy-manager /opt/proxy-manager; then
+    echo "部分目录删除失败，请根据备份手动检查：$backup_dir"
+    return
+  fi
+  systemctl daemon-reload || warning_count=$((warning_count + 1))
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx 2>/dev/null || warning_count=$((warning_count + 1))
+  else
+    warning_count=$((warning_count + 1))
+  fi
+
+  echo "ST-SB 已卸载。"
+  echo "卸载前备份：$backup_dir"
+  echo "已保留 Let’s Encrypt 证书和 sing-box 程序。"
+  if (( warning_count )); then
+    echo "警告：有 ${warning_count} 项防火墙或系统刷新操作未成功，请手动检查 UFW、systemd 和 nginx。"
+  fi
+  exit 0
+}
+
 while true; do
   show_menu
-  read -r -p "请选择 [0-11]: " choice
+  read -r -p "请选择 [0-12]: " choice
   echo
   case "$choice" in
     1) manage_protocols ;;
@@ -1823,12 +1956,13 @@ while true; do
     9) show_firewall ;;
     10) show_node_info ;;
     11) update_proxy ;;
+    12) uninstall_proxy ;;
     0)
       echo "已退出代理节点管理。"
       exit 0
       ;;
     *)
-      echo "无效选择，请输入 0-11。"
+      echo "无效选择，请输入 0-12。"
       ;;
   esac
   pause_menu

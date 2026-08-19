@@ -20,6 +20,7 @@
 - 自动申请和续期 Let's Encrypt 证书
 - 自动配置 UFW，并保留当前 SSH 端口
 - 支持交互式在线更新和更新失败回滚
+- 支持带备份的安全卸载
 
 ## 系统要求
 
@@ -132,6 +133,25 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ShumTin/st-sb-manager/master
 ```
 
 更新器只替换运行文件，不会重新生成用户、订阅令牌或协议密钥；更新前会创建备份，失败时自动恢复。
+
+## 卸载
+
+在 `proxy` 菜单中选择“卸载”，并按提示输入 `UNINSTALL` 确认。卸载前会在 `/root` 下创建完整备份。
+
+卸载会删除：
+
+- ST-SB 的 systemd 服务与运行配置
+- 用户流量和访问审计数据库
+- 管理命令
+- nginx 订阅站点
+- 已启用协议对应的随机 UFW 端口规则
+
+卸载会保留：
+
+- Let’s Encrypt 证书
+- sing-box 可执行文件
+- SSH、TCP 80 和 TCP 443 的 UFW 规则
+- 卸载前备份
 
 ## 访问审计与隐私
 
