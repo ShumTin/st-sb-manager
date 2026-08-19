@@ -137,6 +137,7 @@ mkdir -p "$BACKUP_DIR"
 for old_path in \
   /etc/sing-box/config.json \
   /etc/nginx/sites-available/proxy-subscription \
+  /etc/systemd/system/proxy-hy2-port-hop.service \
   /etc/proxy-manager \
   /var/lib/proxy-manager \
   /opt/proxy-manager \
@@ -153,33 +154,40 @@ OLD_HY2_PORT=""
 OLD_SS2022_PORT=""
 OLD_TUIC_PORT=""
 OLD_TROJAN_PORT=""
+OLD_HY2_HOP_START=""
+OLD_HY2_HOP_END=""
 if [[ -f /etc/proxy-manager/config.json ]]; then
   mapfile -t OLD_PORT_VALUES < <(python3 - <<'PY' || true
 import json
 
 try:
     with open("/etc/proxy-manager/config.json", encoding="utf-8") as handle:
-        ports = json.load(handle)["ports"]
+        config = json.load(handle)
+        ports = config["ports"]
     for name in ("reality", "anytls", "hysteria2", "shadowsocks2022", "tuic", "trojan"):
         print(ports.get(name, ""))
+    print(config.get("hy2_hop_start", ""))
+    print(config.get("hy2_hop_end", ""))
 except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
     pass
 PY
   )
-  if (( ${#OLD_PORT_VALUES[@]} == 6 )); then
+  if (( ${#OLD_PORT_VALUES[@]} == 8 )); then
     OLD_REALITY_PORT=${OLD_PORT_VALUES[0]}
     OLD_ANYTLS_PORT=${OLD_PORT_VALUES[1]}
     OLD_HY2_PORT=${OLD_PORT_VALUES[2]}
     OLD_SS2022_PORT=${OLD_PORT_VALUES[3]}
     OLD_TUIC_PORT=${OLD_PORT_VALUES[4]}
     OLD_TROJAN_PORT=${OLD_PORT_VALUES[5]}
+    OLD_HY2_HOP_START=${OLD_PORT_VALUES[6]}
+    OLD_HY2_HOP_END=${OLD_PORT_VALUES[7]}
   fi
 fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y \
-  curl ca-certificates openssl nginx certbot iproute2 ufw \
+  curl ca-certificates openssl nginx certbot iproute2 iptables ufw \
   python3 python3-grpcio python3-yaml tzdata
 timedatectl set-ntp true || true
 
@@ -354,6 +362,9 @@ if systemctl is-active --quiet proxy-manager 2>/dev/null; then
   PROXY_MANAGER_WAS_ACTIVE=1
 fi
 systemctl stop proxy-manager sing-box 2>/dev/null || true
+systemctl disable --now proxy-hy2-port-hop 2>/dev/null || true
+rm -f /etc/systemd/system/proxy-hy2-port-hop.service
+systemctl daemon-reload
 rm -f /var/lib/proxy-manager/usage.db /var/lib/proxy-manager/usage.db-shm /var/lib/proxy-manager/usage.db-wal
 rm -f /var/lib/proxy-manager/audit.db /var/lib/proxy-manager/audit.db-shm /var/lib/proxy-manager/audit.db-wal
 
@@ -804,7 +815,10 @@ def uri_links(user, row):
     if "anytls" in enabled:
         links.append(f"anytls://{quote(user['anytls_password'], safe='')}@{d}:{p['anytls']}?security=tls&sni={d}&fp=chrome&type=tcp#{tag('AnyTLS')}")
     if "hysteria2" in enabled:
-        links.append(f"hysteria2://{quote(user['hy2_password'], safe='')}@{d}:{p['hysteria2']}/?sni={d}&obfs=salamander&obfs-password={quote(CONFIG['hy2_obfs_password'], safe='')}#{tag('Hysteria2')}")
+        hy2_port = p["hysteria2"]
+        if "hy2_hop_start" in CONFIG:
+            hy2_port = f"{CONFIG['hy2_hop_start']}-{CONFIG['hy2_hop_end']}"
+        links.append(f"hysteria2://{quote(user['hy2_password'], safe='')}@{d}:{hy2_port}/?sni={d}&obfs=salamander&obfs-password={quote(CONFIG['hy2_obfs_password'], safe='')}#{tag('Hysteria2')}")
     if "shadowsocks2022" in enabled:
         password = f"{CONFIG['ss2022_server_password']}:{user['ss2022_password']}"
         userinfo = base64.urlsafe_b64encode(
@@ -844,11 +858,15 @@ def mihomo_subscription(user, row):
             "skip-cert-verify": False, "client-fingerprint": "chrome",
         })
     if "hysteria2" in enabled:
-        actual.append({
+        hysteria2 = {
             "name": "Hysteria2", "type": "hysteria2", "server": d, "port": p["hysteria2"],
             "password": user["hy2_password"], "sni": d, "skip-cert-verify": False,
             "obfs": "salamander", "obfs-password": CONFIG["hy2_obfs_password"],
-        })
+        }
+        if "hy2_hop_start" in CONFIG:
+            hysteria2["ports"] = f"{CONFIG['hy2_hop_start']}-{CONFIG['hy2_hop_end']}"
+            hysteria2["hop-interval"] = int(CONFIG["hy2_hop_interval"])
+        actual.append(hysteria2)
     if "shadowsocks2022" in enabled:
         actual.append({
             "name": "Shadowsocks 2022", "type": "ss", "server": d,
@@ -1363,6 +1381,7 @@ from pathlib import Path
 MANAGER_CONFIG_PATH = Path("/etc/proxy-manager/config.json")
 SINGBOX_CONFIG_PATH = Path("/etc/sing-box/config.json")
 LOCK_PATH = Path("/var/lib/proxy-manager/user-admin.lock")
+HY2_HOP_SERVICE_PATH = Path("/etc/systemd/system/proxy-hy2-port-hop.service")
 PROTOCOLS = {
     "1": ("reality", "VLESS + REALITY", "tcp", "VLESS REALITY"),
     "2": ("anytls", "AnyTLS", "tcp", "AnyTLS"),
@@ -1387,7 +1406,12 @@ class ProtocolManager:
             print("  暂无")
         for key, name, network, _comment in PROTOCOLS.values():
             if key in self.enabled:
-                print(f"  {name:<16} {self.config['ports'][key]}/{network.upper()}")
+                port_text = str(self.config["ports"][key])
+                suffix = ""
+                if key == "hysteria2" and "hy2_hop_start" in self.config:
+                    port_text = f"{self.config['hy2_hop_start']}-{self.config['hy2_hop_end']}"
+                    suffix = f"（端口跳跃，{self.config['hy2_hop_interval']}s）"
+                print(f"  {name:<16} {port_text}/{network.upper()}{suffix}")
         print("\n协议状态：")
         for choice, (key, name, _network, _comment) in PROTOCOLS.items():
             state = "已启用" if key in self.enabled else "可添加"
@@ -1447,6 +1471,97 @@ class ProtocolManager:
             return port
         raise RuntimeError("无法生成空闲随机端口")
 
+    def udp_range_available(self, start, end):
+        used = {80, 443, 8080, 8787, int(self.config["ssh_port"]), *self.config["ports"].values()}
+        for table_path in (Path("/proc/net/udp"), Path("/proc/net/udp6")):
+            try:
+                rows = table_path.read_text(encoding="ascii").splitlines()[1:]
+            except OSError:
+                continue
+            for row in rows:
+                fields = row.split()
+                if len(fields) > 1:
+                    used.add(int(fields[1].rsplit(":", 1)[1], 16))
+        return not any(start <= port <= end for port in used)
+
+    def random_udp_range(self):
+        for _ in range(1000):
+            start = secrets.randbelow(39901) + 20000
+            end = start + 99
+            if self.udp_range_available(start, end):
+                return start, end
+        raise RuntimeError("无法生成连续100个未占用的 UDP 端口")
+
+    def configure_hysteria2_port(self):
+        enabled = input("是否开启 Hysteria2 端口跳跃？[y/N]: ").strip().lower()
+        if enabled not in {"y", "yes"}:
+            return self.random_port()
+        range_text = input("请输入跳跃端口范围（例如 20000-20100，直接回车自动选择100个端口）: ").strip()
+        if range_text:
+            match = re.fullmatch(r"(\d+)-(\d+)", range_text)
+            if not match:
+                raise ValueError("端口范围格式必须为 起始端口-结束端口")
+            start, end = map(int, match.groups())
+            if not (1 <= start < end <= 65535):
+                raise ValueError("端口范围必须在 1-65535 内，且结束端口大于起始端口")
+            if not self.udp_range_available(start, end):
+                raise ValueError("端口范围包含已占用或保留端口")
+        else:
+            start, end = self.random_udp_range()
+        interval_text = input("请输入跳跃间隔秒数（直接回车默认30）: ").strip() or "30"
+        if not interval_text.isdigit() or int(interval_text) < 5:
+            raise ValueError("跳跃间隔必须是至少 5 秒的整数")
+        self.config["hy2_hop_start"] = start
+        self.config["hy2_hop_end"] = end
+        self.config["hy2_hop_interval"] = int(interval_text)
+        return start
+
+    def firewall_rule(self, key, port):
+        if key == "hysteria2" and "hy2_hop_start" in self.config:
+            return f"{self.config['hy2_hop_start']}:{self.config['hy2_hop_end']}/udp"
+        network = next(item[2] for item in PROTOCOLS.values() if item[0] == key)
+        return f"{port}/{network}"
+
+    def install_hy2_hop_service(self):
+        iptables = shutil.which("iptables")
+        if not iptables:
+            raise RuntimeError("未找到 iptables，无法启用端口跳跃")
+        start = self.config["hy2_hop_start"]
+        end = self.config["hy2_hop_end"]
+        port = self.config["ports"]["hysteria2"]
+        rule = f"{iptables} -t nat -C PREROUTING -p udp --dport {start}:{end} -j REDIRECT --to-ports {port}"
+        add_rule = f"{iptables} -t nat -A PREROUTING -p udp --dport {start}:{end} -j REDIRECT --to-ports {port}"
+        delete_rule = f"{iptables} -t nat -D PREROUTING -p udp --dport {start}:{end} -j REDIRECT --to-ports {port}"
+        content = f"""[Unit]
+Description=ST-SB Hysteria2 UDP port hopping
+Before=sing-box.service
+After=network-online.target ufw.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '{rule} || {add_rule}'
+ExecStop=/bin/sh -c '{delete_rule} || true'
+
+[Install]
+WantedBy=multi-user.target
+"""
+        temp_path = HY2_HOP_SERVICE_PATH.with_suffix(".service.temp")
+        temp_path.write_text(content, encoding="utf-8")
+        os.chmod(temp_path, 0o644)
+        os.replace(temp_path, HY2_HOP_SERVICE_PATH)
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "enable", "--now", HY2_HOP_SERVICE_PATH.name], check=True)
+
+    @staticmethod
+    def remove_hy2_hop_service():
+        subprocess.run(
+            ["systemctl", "disable", "--now", HY2_HOP_SERVICE_PATH.name],
+            check=False,
+        )
+        HY2_HOP_SERVICE_PATH.unlink(missing_ok=True)
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
+
     def add_credentials(self, key):
         if key == "reality":
             result = subprocess.check_output(
@@ -1494,7 +1609,8 @@ class ProtocolManager:
             for user in self.config["users"]:
                 user.pop("anytls_password", None)
         elif key == "hysteria2":
-            self.config.pop("hy2_obfs_password", None)
+            for field in ("hy2_obfs_password", "hy2_hop_start", "hy2_hop_end", "hy2_hop_interval"):
+                self.config.pop(field, None)
             for user in self.config["users"]:
                 user.pop("hy2_password", None)
         elif key == "shadowsocks2022":
@@ -1524,7 +1640,10 @@ class ProtocolManager:
         lines = [
             line for line in path.read_text(encoding="utf-8").splitlines()
             if not line.startswith("代理协议端口:")
-            and not any(line.endswith(name) for name in protocol_names)
+            and not (
+                line.startswith(("TCP", "UDP"))
+                and any(name in line for name in protocol_names)
+            )
         ]
         insert_at = next(
             (index + 1 for index, line in enumerate(lines) if line.startswith("TCP 443")),
@@ -1535,7 +1654,12 @@ class ProtocolManager:
             protocol_lines = ["代理协议端口:"]
             for key, name, network, _comment in PROTOCOLS.values():
                 if key in self.enabled:
-                    protocol_lines.append(f"{network.upper():<7} {self.config['ports'][key]:<5} {name}")
+                    port_text = str(self.config["ports"][key])
+                    suffix = ""
+                    if key == "hysteria2" and "hy2_hop_start" in self.config:
+                        port_text = f"{self.config['hy2_hop_start']}-{self.config['hy2_hop_end']}"
+                        suffix = f"（端口跳跃，{self.config['hy2_hop_interval']}s）"
+                    protocol_lines.append(f"{network.upper():<7} {port_text:<11} {name}{suffix}")
         lines[insert_at:insert_at] = protocol_lines
         temp_path = path.with_suffix(".txt.protocol-temp")
         temp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1544,7 +1668,7 @@ class ProtocolManager:
 
     def enable(self, protocol):
         key, name, network, comment = protocol
-        port = self.random_port()
+        port = self.configure_hysteria2_port() if key == "hysteria2" else self.random_port()
         self.config["ports"][key] = port
         self.add_credentials(key)
         self.enabled.append(key)
@@ -1557,6 +1681,8 @@ class ProtocolManager:
             "proxy-manager": self.service_active("proxy-manager"),
         }
         firewall_added = False
+        hop_service_touched = False
+        firewall_rule = self.firewall_rule(key, port)
         try:
             shutil.copy2(MANAGER_CONFIG_PATH, manager_backup)
             shutil.copy2(SINGBOX_CONFIG_PATH, singbox_backup)
@@ -1564,8 +1690,11 @@ class ProtocolManager:
                 subprocess.run(["systemctl", "stop", "proxy-manager"], check=True, timeout=30)
             self.user_manager.write_atomic(MANAGER_CONFIG_PATH, self.config)
             self.user_manager.write_atomic(SINGBOX_CONFIG_PATH, singbox_config)
-            subprocess.run(["ufw", "allow", f"{port}/{network}", "comment", comment], check=True)
+            subprocess.run(["ufw", "allow", firewall_rule, "comment", comment], check=True)
             firewall_added = True
+            if key == "hysteria2" and "hy2_hop_start" in self.config:
+                hop_service_touched = True
+                self.install_hy2_hop_service()
             if service_state["sing-box"]:
                 subprocess.run(["systemctl", "restart", "sing-box"], check=True, timeout=30)
             if service_state["proxy-manager"]:
@@ -1574,7 +1703,9 @@ class ProtocolManager:
             shutil.copy2(manager_backup, MANAGER_CONFIG_PATH)
             shutil.copy2(singbox_backup, SINGBOX_CONFIG_PATH)
             if firewall_added:
-                subprocess.run(["ufw", "--force", "delete", "allow", f"{port}/{network}"], check=False)
+                subprocess.run(["ufw", "--force", "delete", "allow", firewall_rule], check=False)
+            if hop_service_touched:
+                self.remove_hy2_hop_service()
             if service_state["sing-box"]:
                 subprocess.run(["systemctl", "restart", "sing-box"], check=False)
             if service_state["proxy-manager"]:
@@ -1587,19 +1718,24 @@ class ProtocolManager:
             self.refresh_node_info()
         except OSError as exc:
             print(f"警告：节点信息文件更新失败：{exc}")
-        print(f"已启用 {name}：{port}/{network.upper()}")
+        display_port = firewall_rule.removesuffix(f"/{network}")
+        print(f"已启用 {name}：{display_port}/{network.upper()}")
         if self.config["users"]:
             print("已有用户的订阅地址不变，刷新订阅即可获取新协议。")
 
     def disable(self, protocol):
         key, name, network, comment = protocol
-        port = self.config["ports"].pop(key)
+        port = self.config["ports"][key]
+        firewall_rule = self.firewall_rule(key, port)
+        hop_enabled = key == "hysteria2" and "hy2_hop_start" in self.config
+        self.config["ports"].pop(key)
         self.enabled.remove(key)
         self.remove_credentials(key)
         singbox_config = self.user_manager.build_singbox_config()
         self.user_manager.validate_singbox(singbox_config)
         manager_backup = MANAGER_CONFIG_PATH.with_suffix(".json.protocol-backup")
         singbox_backup = SINGBOX_CONFIG_PATH.with_suffix(".json.protocol-backup")
+        hop_service_backup = HY2_HOP_SERVICE_PATH.with_suffix(".service.protocol-backup")
         service_state = {
             "sing-box": self.service_active("sing-box"),
             "proxy-manager": self.service_active("proxy-manager"),
@@ -1608,12 +1744,16 @@ class ProtocolManager:
         try:
             shutil.copy2(MANAGER_CONFIG_PATH, manager_backup)
             shutil.copy2(SINGBOX_CONFIG_PATH, singbox_backup)
+            if hop_enabled and HY2_HOP_SERVICE_PATH.exists():
+                shutil.copy2(HY2_HOP_SERVICE_PATH, hop_service_backup)
             if service_state["proxy-manager"]:
                 subprocess.run(["systemctl", "stop", "proxy-manager"], check=True, timeout=30)
             self.user_manager.write_atomic(MANAGER_CONFIG_PATH, self.config)
             self.user_manager.write_atomic(SINGBOX_CONFIG_PATH, singbox_config)
+            if hop_enabled:
+                self.remove_hy2_hop_service()
             result = subprocess.run(
-                ["ufw", "--force", "delete", "allow", f"{port}/{network}"],
+                ["ufw", "--force", "delete", "allow", firewall_rule],
                 check=False,
             )
             firewall_removed = result.returncode == 0
@@ -1626,7 +1766,14 @@ class ProtocolManager:
             shutil.copy2(singbox_backup, SINGBOX_CONFIG_PATH)
             if firewall_removed:
                 subprocess.run(
-                    ["ufw", "allow", f"{port}/{network}", "comment", comment],
+                    ["ufw", "allow", firewall_rule, "comment", comment],
+                    check=False,
+                )
+            if hop_service_backup.exists():
+                shutil.copy2(hop_service_backup, HY2_HOP_SERVICE_PATH)
+                subprocess.run(["systemctl", "daemon-reload"], check=False)
+                subprocess.run(
+                    ["systemctl", "enable", "--now", HY2_HOP_SERVICE_PATH.name],
                     check=False,
                 )
             if service_state["sing-box"]:
@@ -1637,11 +1784,13 @@ class ProtocolManager:
         finally:
             manager_backup.unlink(missing_ok=True)
             singbox_backup.unlink(missing_ok=True)
+            hop_service_backup.unlink(missing_ok=True)
         try:
             self.refresh_node_info()
         except OSError as exc:
             print(f"警告：节点信息文件更新失败：{exc}")
-        print(f"已删除 {name}，并关闭 {port}/{network.upper()}。")
+        display_port = firewall_rule.removesuffix(f"/{network}")
+        print(f"已删除 {name}，并关闭 {display_port}/{network.upper()}。")
         if self.config["users"]:
             print("已有用户的订阅地址不变，刷新订阅后该协议将消失。")
 
@@ -1887,6 +2036,7 @@ uninstall_proxy() {
     /opt/proxy-manager \
     /etc/systemd/system/sing-box.service \
     /etc/systemd/system/proxy-manager.service \
+    /etc/systemd/system/proxy-hy2-port-hop.service \
     /etc/nginx/sites-available/proxy-subscription \
     /etc/nginx/sites-enabled/proxy-subscription \
     /etc/letsencrypt/renewal-hooks/deploy/reload-proxy-services \
@@ -1924,11 +2074,15 @@ networks = {
 }
 try:
     with open("/etc/proxy-manager/config.json", encoding="utf-8") as handle:
-        ports = json.load(handle).get("ports", {})
+        config = json.load(handle)
+        ports = config.get("ports", {})
     for name, network in networks.items():
         port = ports.get(name)
         if isinstance(port, int) and 1 <= port <= 65535:
-            print(f"{port}/{network}")
+            if name == "hysteria2" and "hy2_hop_start" in config:
+                print(f"{config['hy2_hop_start']}:{config['hy2_hop_end']}/udp")
+            else:
+                print(f"{port}/{network}")
 except (OSError, TypeError, ValueError, json.JSONDecodeError):
     pass
 PY
@@ -1939,6 +2093,7 @@ PY
     echo "服务停止失败，已终止卸载；备份位于：$backup_dir"
     return
   fi
+  systemctl disable --now proxy-hy2-port-hop >/dev/null 2>&1 || true
   systemctl disable proxy-manager sing-box >/dev/null 2>&1 || warning_count=$((warning_count + 1))
   for rule in "${firewall_rules[@]}"; do
     ufw --force delete allow "$rule" >/dev/null 2>&1 || warning_count=$((warning_count + 1))
@@ -1947,6 +2102,7 @@ PY
   if ! rm -f \
     /etc/systemd/system/sing-box.service \
     /etc/systemd/system/proxy-manager.service \
+    /etc/systemd/system/proxy-hy2-port-hop.service \
     /etc/nginx/sites-enabled/proxy-subscription \
     /etc/nginx/sites-available/proxy-subscription \
     /etc/letsencrypt/renewal-hooks/deploy/reload-proxy-services \
@@ -2713,7 +2869,9 @@ fi
 if [[ -n "$OLD_ANYTLS_PORT" ]]; then
   ufw --force delete allow "${OLD_ANYTLS_PORT}/tcp" || true
 fi
-if [[ -n "$OLD_HY2_PORT" ]]; then
+if [[ -n "$OLD_HY2_HOP_START" && -n "$OLD_HY2_HOP_END" ]]; then
+  ufw --force delete allow "${OLD_HY2_HOP_START}:${OLD_HY2_HOP_END}/udp" || true
+elif [[ -n "$OLD_HY2_PORT" ]]; then
   ufw --force delete allow "${OLD_HY2_PORT}/udp" || true
 fi
 if [[ -n "$OLD_SS2022_PORT" ]]; then
