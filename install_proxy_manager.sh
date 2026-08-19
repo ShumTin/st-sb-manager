@@ -496,6 +496,7 @@ info += [
     "",
     "日常管理命令：",
     "proxy                              打开交互式管理菜单",
+    "proxy-update                       安全更新管理程序",
     "proxy-user-add                     新增用户",
     "proxy-user-status                  查看所有用户状态",
     "",
@@ -1402,6 +1403,188 @@ done
 EOF
 chmod 700 /usr/local/sbin/proxy
 
+cat > /usr/local/sbin/proxy-update <<'PY'
+#!/usr/bin/env python3
+import fcntl
+import os
+import py_compile
+import re
+import shutil
+import subprocess
+import tempfile
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+SOURCE_URL = "https://raw.githubusercontent.com/ShumTin/st-sb-manager/master/install_proxy_manager.sh"
+LOCK_PATH = Path("/run/lock/proxy-manager-install.lock")
+TARGETS = (
+    Path("/opt/proxy-manager/manager.py"),
+    Path("/opt/proxy-manager/audit_supervisor.py"),
+    Path("/usr/local/sbin/proxy-user-add"),
+    Path("/usr/local/sbin/proxy"),
+    Path("/usr/local/sbin/proxy-update"),
+    Path("/usr/local/sbin/proxy-user-status"),
+    Path("/usr/local/sbin/proxy-audit"),
+)
+HEADER_RE = re.compile(r"^cat > (\S+) <<'([A-Z]+)'$")
+
+
+class ProxyUpdater:
+    def __init__(self):
+        self.changed = []
+        self.backup_dir = Path("/root") / f"proxy-update-backup-{datetime.now():%Y%m%d-%H%M%S-%f}"
+        self.was_active = {}
+
+    @staticmethod
+    def download_source():
+        request = urllib.request.Request(SOURCE_URL, headers={"User-Agent": "ST-SB-Updater/1.0"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read().decode("utf-8")
+
+    @staticmethod
+    def extract_files(source):
+        expected = {str(path): path for path in TARGETS}
+        extracted = {}
+        lines = source.splitlines(keepends=True)
+        index = 0
+        while index < len(lines):
+            match = HEADER_RE.fullmatch(lines[index].rstrip("\r\n"))
+            if not match or match.group(1) not in expected:
+                index += 1
+                continue
+            target = expected[match.group(1)]
+            delimiter = match.group(2)
+            end = index + 1
+            while end < len(lines) and lines[end].rstrip("\r\n") != delimiter:
+                end += 1
+            if end >= len(lines):
+                raise RuntimeError(f"远程安装脚本中的 {target} 未正确结束")
+            extracted[target] = "".join(lines[index + 1:end]).encode("utf-8")
+            index = end + 1
+        missing = [str(path) for path in TARGETS if path not in extracted]
+        if missing:
+            raise RuntimeError("远程安装脚本缺少更新文件：" + "、".join(missing))
+        return extracted
+
+    @staticmethod
+    def validate_files(extracted, stage_dir):
+        staged = {}
+        for target, content in extracted.items():
+            stage_path = stage_dir / target.name
+            stage_path.write_bytes(content)
+            os.chmod(stage_path, 0o700)
+            staged[target] = stage_path
+            if target.name == "proxy":
+                subprocess.run(["bash", "-n", stage_path], check=True)
+            else:
+                py_compile.compile(str(stage_path), doraise=True)
+        return staged
+
+    def find_changes(self, extracted):
+        self.changed = [
+            target for target, content in extracted.items()
+            if not target.exists() or target.read_bytes() != content
+        ]
+
+    def backup_files(self):
+        for target in self.changed:
+            if not target.exists():
+                continue
+            backup_path = self.backup_dir / target.relative_to("/")
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, backup_path)
+
+    def remember_service_state(self):
+        service_targets = {
+            "sing-box": Path("/opt/proxy-manager/audit_supervisor.py"),
+            "proxy-manager": Path("/opt/proxy-manager/manager.py"),
+        }
+        for service, target in service_targets.items():
+            if target not in self.changed:
+                self.was_active[service] = False
+                continue
+            result = subprocess.run(["systemctl", "is-active", "--quiet", service], check=False)
+            self.was_active[service] = result.returncode == 0
+
+    def stop_services(self):
+        for service in ("proxy-manager", "sing-box"):
+            if self.was_active[service]:
+                subprocess.run(["systemctl", "stop", service], check=True, timeout=30)
+
+    def install_files(self, staged):
+        for target in self.changed:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_path = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+            os.close(fd)
+            try:
+                shutil.copyfile(staged[target], temp_path)
+                os.chmod(temp_path, 0o700)
+                os.replace(temp_path, target)
+            finally:
+                Path(temp_path).unlink(missing_ok=True)
+
+    def start_services(self):
+        for service in ("sing-box", "proxy-manager"):
+            if not self.was_active[service]:
+                continue
+            subprocess.run(["systemctl", "start", service], check=True, timeout=30)
+            subprocess.run(["systemctl", "is-active", "--quiet", service], check=True)
+
+    def rollback(self):
+        for target in self.changed:
+            backup_path = self.backup_dir / target.relative_to("/")
+            if backup_path.exists():
+                shutil.copy2(backup_path, target)
+            else:
+                target.unlink(missing_ok=True)
+        for service in ("sing-box", "proxy-manager"):
+            if self.was_active.get(service):
+                subprocess.run(["systemctl", "start", service], check=False)
+
+    def run(self):
+        source = self.download_source()
+        extracted = self.extract_files(source)
+        self.find_changes(extracted)
+        if not self.changed:
+            print("当前已经是最新版本。")
+            return
+        with tempfile.TemporaryDirectory(prefix="proxy-update-") as temp_dir:
+            staged = self.validate_files(extracted, Path(temp_dir))
+            self.backup_files()
+            self.remember_service_state()
+            try:
+                self.stop_services()
+                self.install_files(staged)
+                self.start_services()
+            except Exception:
+                self.rollback()
+                raise
+        print("更新完成。")
+        print("已更新：" + "、".join(target.name for target in self.changed))
+        print(f"更新前备份：{self.backup_dir}")
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit("请使用 root 运行：sudo proxy-update")
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("w") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SystemExit("安装或更新程序正在运行，请稍后重试。") from exc
+        try:
+            ProxyUpdater().run()
+        except (OSError, RuntimeError, subprocess.SubprocessError, py_compile.PyCompileError) as exc:
+            raise SystemExit(f"更新失败：{exc}") from exc
+
+
+if __name__ == "__main__":
+    main()
+PY
+chmod 700 /usr/local/sbin/proxy-update
+
 cat > /opt/proxy-manager/audit_supervisor.py <<'PY'
 #!/usr/bin/env python3
 """Run sing-box and persist only sanitized destination metadata for seven days."""
@@ -1878,6 +2061,7 @@ python3 -m py_compile \
   /opt/proxy-manager/manager.py \
   /opt/proxy-manager/audit_supervisor.py \
   /usr/local/sbin/proxy-user-add \
+  /usr/local/sbin/proxy-update \
   /usr/local/sbin/proxy-user-status \
   /usr/local/sbin/proxy-audit
 bash -n /usr/local/sbin/proxy
