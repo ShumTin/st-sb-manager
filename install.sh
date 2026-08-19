@@ -1602,6 +1602,7 @@ show_menu() {
 │  8. 服务日志                     │
 │  9. 防火墙                       │
 │ 10. 节点信息                     │
+│ 11. 更新版本                     │
 │  0. 退出                         │
 ╚──────────────────────────────────╝"
 }
@@ -1652,9 +1653,13 @@ show_node_info() {
   cat /root/node-info.txt
 }
 
+update_proxy() {
+  proxy-update
+}
+
 while true; do
   show_menu
-  read -r -p "请选择 [0-10]: " choice
+  read -r -p "请选择 [0-11]: " choice
   echo
   case "$choice" in
     1) manage_protocols ;;
@@ -1667,12 +1672,13 @@ while true; do
     8) show_service_logs ;;
     9) show_firewall ;;
     10) show_node_info ;;
+    11) update_proxy ;;
     0)
       echo "已退出代理节点管理。"
       exit 0
       ;;
     *)
-      echo "无效选择，请输入 0-10。"
+      echo "无效选择，请输入 0-11。"
       ;;
   esac
   pause_menu
