@@ -1567,6 +1567,51 @@ if __name__ == "__main__":
 PY
 chmod 700 /usr/local/sbin/proxy-protocol
 
+cat > /usr/local/sbin/proxy-node-info <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+NODE_INFO_PATH=/root/node-info.txt
+if [[ ! -r "$NODE_INFO_PATH" ]]; then
+  echo "节点信息文件不存在：$NODE_INFO_PATH"
+  exit 1
+fi
+
+COLOR_GREEN=""
+COLOR_YELLOW=""
+COLOR_CYAN=""
+COLOR_RED=""
+COLOR_RESET=""
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  COLOR_GREEN=$'\033[1;32m'
+  COLOR_YELLOW=$'\033[1;33m'
+  COLOR_CYAN=$'\033[1;36m'
+  COLOR_RED=$'\033[1;31m'
+  COLOR_RESET=$'\033[0m'
+fi
+
+while IFS= read -r line; do
+  case "$line" in
+    "云服务商安全组需要放行："|"代理协议端口: "*|"日常管理命令："|"格式强制参数（通常无需使用）："|"审计查询命令：")
+      printf '%b%s%b\n' "$COLOR_YELLOW" "$line" "$COLOR_RESET"
+      ;;
+    "域名: "*|"搬瓦工下次流量重置: "*|"SSH端口: "*)
+      printf '%b%s%b\n' "$COLOR_GREEN" "$line" "$COLOR_RESET"
+      ;;
+    TCP*|UDP*|proxy*|\?target=*)
+      printf '%b%s%b\n' "$COLOR_CYAN" "$line" "$COLOR_RESET"
+      ;;
+    "请明确告知所有使用者已启用域名/IP级访问审计。"|"严禁把 /etc/proxy-manager/config.json 发给他人，其中包含全部服务端密钥。")
+      printf '%b%s%b\n' "$COLOR_RED" "$line" "$COLOR_RESET"
+      ;;
+    *)
+      printf '%s\n' "$line"
+      ;;
+  esac
+done < "$NODE_INFO_PATH"
+EOF
+chmod 700 /usr/local/sbin/proxy-node-info
+
 cat > /usr/local/sbin/proxy <<'EOF'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -1650,7 +1695,11 @@ show_firewall() {
 }
 
 show_node_info() {
-  cat /root/node-info.txt
+  if command -v proxy-node-info >/dev/null 2>&1; then
+    proxy-node-info
+  else
+    cat /root/node-info.txt
+  fi
 }
 
 update_proxy() {
@@ -1707,6 +1756,7 @@ TARGETS = (
     Path("/opt/proxy-manager/audit_supervisor.py"),
     Path("/usr/local/sbin/proxy-user-add"),
     Path("/usr/local/sbin/proxy-protocol"),
+    Path("/usr/local/sbin/proxy-node-info"),
     Path("/usr/local/sbin/proxy"),
     Path("/usr/local/sbin/proxy-update"),
     Path("/usr/local/sbin/proxy-user-status"),
@@ -1760,7 +1810,7 @@ class ProxyUpdater:
             stage_path.write_bytes(content)
             os.chmod(stage_path, 0o700)
             staged[target] = stage_path
-            if target.name == "proxy":
+            if target.name in {"proxy", "proxy-node-info"}:
                 subprocess.run(["bash", "-n", stage_path], check=True)
             else:
                 py_compile.compile(str(stage_path), doraise=True)
@@ -2353,6 +2403,7 @@ python3 -m py_compile \
   /usr/local/sbin/proxy-user-status \
   /usr/local/sbin/proxy-audit
 bash -n /usr/local/sbin/proxy
+bash -n /usr/local/sbin/proxy-node-info
 sh -n /etc/letsencrypt/renewal-hooks/deploy/reload-proxy-services
 nginx -t
 "$SB_BIN" check -c /etc/sing-box/config.json
@@ -2402,42 +2453,17 @@ INSTALL_SUCCEEDED=1
 COLOR_GREEN=""
 COLOR_YELLOW=""
 COLOR_CYAN=""
-COLOR_RED=""
 COLOR_RESET=""
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   COLOR_GREEN=$'\033[1;32m'
   COLOR_YELLOW=$'\033[1;33m'
   COLOR_CYAN=$'\033[1;36m'
-  COLOR_RED=$'\033[1;31m'
   COLOR_RESET=$'\033[0m'
 fi
 
-print_colored_node_info() {
-  local line
-  while IFS= read -r line; do
-    case "$line" in
-      "云服务商安全组需要放行："|"代理协议端口: "*|"日常管理命令："|"格式强制参数（通常无需使用）："|"审计查询命令：")
-        printf '%b%s%b\n' "$COLOR_YELLOW" "$line" "$COLOR_RESET"
-        ;;
-      "域名: "*|"搬瓦工下次流量重置: "*|"SSH端口: "*)
-        printf '%b%s%b\n' "$COLOR_GREEN" "$line" "$COLOR_RESET"
-        ;;
-      TCP*|UDP*|proxy*|\?target=*)
-        printf '%b%s%b\n' "$COLOR_CYAN" "$line" "$COLOR_RESET"
-        ;;
-      "请明确告知所有使用者已启用域名/IP级访问审计。"|"严禁把 /etc/proxy-manager/config.json 发给他人，其中包含全部服务端密钥。")
-        printf '%b%s%b\n' "$COLOR_RED" "$line" "$COLOR_RESET"
-        ;;
-      *)
-        printf '%s\n' "$line"
-        ;;
-    esac
-  done < /root/node-info.txt
-}
-
 echo
 printf '%b=== 安装完成 ===%b\n' "$COLOR_GREEN" "$COLOR_RESET"
-print_colored_node_info
+proxy-node-info
 echo
 printf '%b下一步%b\n' "$COLOR_YELLOW" "$COLOR_RESET"
 printf '  1. 运行 %bproxy%b 打开管理菜单\n' "$COLOR_CYAN" "$COLOR_RESET"
