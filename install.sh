@@ -423,7 +423,7 @@ Path("/etc/proxy-manager/config.json").write_text(json.dumps(manager_config, ens
 
 info = [
     f"域名: {domain}",
-    "协议管理: 安装后运行 proxy 并选择 1，逐个启用所需协议",
+    "协议管理: 安装后运行 proxy 并选择 1，按需启用或删除协议",
     "用户管理: 启用协议后运行 proxy 并选择 2，按需创建用户",
     "套餐策略: 每个用户独立设置流量、到期时间和自动续期",
     "计费时区: America/New_York（与搬瓦工计费周期一致）",
@@ -447,7 +447,7 @@ info += [
     "",
     "日常管理命令：",
     "proxy                              打开交互式管理菜单",
-    "proxy-protocol                     逐个启用代理协议",
+    "proxy-protocol                     启用或删除代理协议",
     "proxy-update                       安全更新管理程序",
     "proxy-user-add                     新增用户",
     "proxy-user-status                  查看所有用户状态",
@@ -1309,22 +1309,42 @@ class ProtocolManager:
         for key, name, network, _comment in PROTOCOLS.values():
             if key in self.enabled:
                 print(f"  {name:<16} {self.config['ports'][key]}/{network.upper()}")
-        print("\n可添加协议：")
+        print("\n协议状态：")
         for choice, (key, name, _network, _comment) in PROTOCOLS.items():
             state = "已启用" if key in self.enabled else "可添加"
             print(f"  {choice}. {name:<16} {state}")
-        print("  0. 返回")
+        print("\n操作：1. 添加协议  2. 删除协议  0. 返回")
 
-    def choose(self):
+    def choose_action(self):
         self.show()
-        choice = input("请选择 [0-3]: ").strip()
+        choice = input("请选择操作 [0-2]: ").strip()
         if choice == "0":
             return None
+        if choice not in {"1", "2"}:
+            raise ValueError("请选择 0-2")
+        return choice
+
+    def choose_to_add(self):
+        choice = input("请选择要添加的协议 [1-3]: ").strip()
         if choice not in PROTOCOLS:
-            raise ValueError("请选择 0-3")
+            raise ValueError("请选择 1-3")
         protocol = PROTOCOLS[choice]
         if protocol[0] in self.enabled:
             raise ValueError(f"{protocol[1]} 已经启用")
+        return protocol
+
+    def choose_to_remove(self):
+        if not self.enabled:
+            raise ValueError("当前没有已启用的协议")
+        choice = input("请选择要删除的协议 [1-3]: ").strip()
+        if choice not in PROTOCOLS:
+            raise ValueError("请选择 1-3")
+        protocol = PROTOCOLS[choice]
+        if protocol[0] not in self.enabled:
+            raise ValueError(f"{protocol[1]} 尚未启用")
+        confirm = input(f"确认删除 {protocol[1]}？输入 yes 继续: ").strip().lower()
+        if confirm != "yes":
+            raise ValueError("已取消删除")
         return protocol
 
     def random_port(self):
@@ -1372,6 +1392,22 @@ class ProtocolManager:
             for user in self.config["users"]:
                 user["hy2_password"] = secrets.token_hex(16)
 
+    def remove_credentials(self, key):
+        if key == "reality":
+            for field in (
+                "reality_private_key", "reality_public_key", "reality_short_id", "reality_server",
+            ):
+                self.config.pop(field, None)
+            for user in self.config["users"]:
+                user.pop("vless_reality_uuid", None)
+        elif key == "anytls":
+            for user in self.config["users"]:
+                user.pop("anytls_password", None)
+        elif key == "hysteria2":
+            self.config.pop("hy2_obfs_password", None)
+            for user in self.config["users"]:
+                user.pop("hy2_password", None)
+
     @staticmethod
     def service_active(service):
         return subprocess.run(
@@ -1393,17 +1429,19 @@ class ProtocolManager:
             (index + 1 for index, line in enumerate(lines) if line.startswith("TCP 443")),
             len(lines),
         )
-        protocol_lines = ["代理协议端口:"]
-        for key, name, network, _comment in PROTOCOLS.values():
-            if key in self.enabled:
-                protocol_lines.append(f"{network.upper():<7} {self.config['ports'][key]:<5} {name}")
+        protocol_lines = ["代理协议端口: 尚未启用；运行 proxy 并进入协议管理"]
+        if self.enabled:
+            protocol_lines = ["代理协议端口:"]
+            for key, name, network, _comment in PROTOCOLS.values():
+                if key in self.enabled:
+                    protocol_lines.append(f"{network.upper():<7} {self.config['ports'][key]:<5} {name}")
         lines[insert_at:insert_at] = protocol_lines
         temp_path = path.with_suffix(".txt.protocol-temp")
         temp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         os.chmod(temp_path, 0o600)
         os.replace(temp_path, path)
 
-    def apply(self, protocol):
+    def enable(self, protocol):
         key, name, network, comment = protocol
         port = self.random_port()
         self.config["ports"][key] = port
@@ -1452,6 +1490,60 @@ class ProtocolManager:
         if self.config["users"]:
             print("已有用户的订阅地址不变，刷新订阅即可获取新协议。")
 
+    def disable(self, protocol):
+        key, name, network, comment = protocol
+        port = self.config["ports"].pop(key)
+        self.enabled.remove(key)
+        self.remove_credentials(key)
+        singbox_config = self.user_manager.build_singbox_config()
+        self.user_manager.validate_singbox(singbox_config)
+        manager_backup = MANAGER_CONFIG_PATH.with_suffix(".json.protocol-backup")
+        singbox_backup = SINGBOX_CONFIG_PATH.with_suffix(".json.protocol-backup")
+        service_state = {
+            "sing-box": self.service_active("sing-box"),
+            "proxy-manager": self.service_active("proxy-manager"),
+        }
+        firewall_removed = False
+        try:
+            shutil.copy2(MANAGER_CONFIG_PATH, manager_backup)
+            shutil.copy2(SINGBOX_CONFIG_PATH, singbox_backup)
+            if service_state["proxy-manager"]:
+                subprocess.run(["systemctl", "stop", "proxy-manager"], check=True, timeout=30)
+            self.user_manager.write_atomic(MANAGER_CONFIG_PATH, self.config)
+            self.user_manager.write_atomic(SINGBOX_CONFIG_PATH, singbox_config)
+            result = subprocess.run(
+                ["ufw", "--force", "delete", "allow", f"{port}/{network}"],
+                check=False,
+            )
+            firewall_removed = result.returncode == 0
+            if service_state["sing-box"]:
+                subprocess.run(["systemctl", "restart", "sing-box"], check=True, timeout=30)
+            if service_state["proxy-manager"]:
+                subprocess.run(["systemctl", "start", "proxy-manager"], check=True, timeout=30)
+        except Exception:
+            shutil.copy2(manager_backup, MANAGER_CONFIG_PATH)
+            shutil.copy2(singbox_backup, SINGBOX_CONFIG_PATH)
+            if firewall_removed:
+                subprocess.run(
+                    ["ufw", "allow", f"{port}/{network}", "comment", comment],
+                    check=False,
+                )
+            if service_state["sing-box"]:
+                subprocess.run(["systemctl", "restart", "sing-box"], check=False)
+            if service_state["proxy-manager"]:
+                subprocess.run(["systemctl", "start", "proxy-manager"], check=False)
+            raise
+        finally:
+            manager_backup.unlink(missing_ok=True)
+            singbox_backup.unlink(missing_ok=True)
+        try:
+            self.refresh_node_info()
+        except OSError as exc:
+            print(f"警告：节点信息文件更新失败：{exc}")
+        print(f"已删除 {name}，并关闭 {port}/{network.upper()}。")
+        if self.config["users"]:
+            print("已有用户的订阅地址不变，刷新订阅后该协议将消失。")
+
 
 def main():
     if os.geteuid() != 0:
@@ -1461,9 +1553,11 @@ def main():
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         manager = ProtocolManager()
         try:
-            protocol = manager.choose()
-            if protocol is not None:
-                manager.apply(protocol)
+            action = manager.choose_action()
+            if action == "1":
+                manager.enable(manager.choose_to_add())
+            elif action == "2":
+                manager.disable(manager.choose_to_remove())
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
             raise SystemExit(f"协议操作失败：{exc}") from exc
 
