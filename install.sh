@@ -1743,12 +1743,11 @@ show_menu() {
 │  3. 用户状态                     │
 │  4. 访问审计                     │
 │  5. 配置检查                     │
-│  6. 服务状态                     │
-│  7. 服务日志                     │
-│  8. 防火墙                       │
-│  9. 节点信息                     │
-│ 10. 更新版本                     │
-│ 11. 卸载                         │
+│  6. 服务管理                     │
+│  7. 防火墙                       │
+│  8. 节点信息                     │
+│  9. 更新版本                     │
+│ 10. 卸载                         │
 │  0. 退出                         │
 ╚──────────────────────────────────╝"
 }
@@ -1814,6 +1813,26 @@ show_service_logs() {
   echo
   echo "--- proxy-manager 最近50行日志 ---"
   journalctl -u proxy-manager -n 50 --no-pager
+}
+
+manage_services() {
+  local choice
+  echo "
+╔──────────────────────────────────╗
+│             服务管理             │
+├──────────────────────────────────┤
+│  1. 服务状态                     │
+│  2. 服务日志                     │
+│  0. 返回                         │
+╚──────────────────────────────────╝"
+  read -r -p "请选择 [0-2]: " choice
+  echo
+  case "$choice" in
+    1) show_service_status ;;
+    2) show_service_logs ;;
+    0) return ;;
+    *) echo "无效选择，请输入 0-2。" ;;
+  esac
 }
 
 show_firewall() {
@@ -1966,7 +1985,7 @@ PY
 
 while true; do
   show_menu
-  read -r -p "请选择 [0-11]: " choice
+  read -r -p "请选择 [0-10]: " choice
   echo
   case "$choice" in
     1) manage_protocols ;;
@@ -1974,18 +1993,17 @@ while true; do
     3) show_users ;;
     4) manage_audit ;;
     5) check_singbox_config ;;
-    6) show_service_status ;;
-    7) show_service_logs ;;
-    8) show_firewall ;;
-    9) show_node_info ;;
-    10) update_proxy ;;
-    11) uninstall_proxy ;;
+    6) manage_services ;;
+    7) show_firewall ;;
+    8) show_node_info ;;
+    9) update_proxy ;;
+    10) uninstall_proxy ;;
     0)
       echo "已退出代理节点管理。"
       exit 0
       ;;
     *)
-      echo "无效选择，请输入 0-11。"
+      echo "无效选择，请输入 0-10。"
       ;;
   esac
   pause_menu
