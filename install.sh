@@ -481,7 +481,6 @@ cat > /opt/proxy-manager/manager.py <<'PY'
 import base64
 import calendar
 import json
-import math
 import os
 import re
 import sqlite3
@@ -788,10 +787,9 @@ def status_names(user, row):
     remaining = max(0, int(user["quota_bytes"]) - used)
     gib = remaining / (1024 ** 3)
     expiry = datetime.fromtimestamp(int(user["expires_at"]), BILLING_TZ)
-    days = max(0, math.ceil((expiry - datetime.now(BILLING_TZ)).total_seconds() / 86400))
     state = row["blocked_reason"] if row["blocked"] else "可用"
     renewal = "自动续期" if user["auto_renew"] else "到期停用"
-    return f"剩余流量：{gib:.1f} GiB（{state}）", f"有效期：{days} 天（{renewal}）"
+    return f"剩余流量：{gib:.1f} GiB（{state}）", f"有效期：{expiry:%Y-%m-%d}（{renewal}）"
 
 def uri_links(user, row):
     d = CONFIG["domain"]
@@ -802,21 +800,21 @@ def uri_links(user, row):
         return quote(value, safe="")
     links = []
     if "reality" in enabled:
-        links.append(f"vless://{user['vless_reality_uuid']}@{d}:{p['reality']}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={CONFIG['reality_server']}&fp=chrome&pbk={CONFIG['reality_public_key']}&sid={CONFIG['reality_short_id']}&type=tcp#{tag('01 VLESS-REALITY')}")
+        links.append(f"vless://{user['vless_reality_uuid']}@{d}:{p['reality']}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={CONFIG['reality_server']}&fp=chrome&pbk={CONFIG['reality_public_key']}&sid={CONFIG['reality_short_id']}&type=tcp#{tag('VLESS-REALITY')}")
     if "anytls" in enabled:
-        links.append(f"anytls://{quote(user['anytls_password'], safe='')}@{d}:{p['anytls']}?security=tls&sni={d}&fp=chrome&type=tcp#{tag('02 AnyTLS')}")
+        links.append(f"anytls://{quote(user['anytls_password'], safe='')}@{d}:{p['anytls']}?security=tls&sni={d}&fp=chrome&type=tcp#{tag('AnyTLS')}")
     if "hysteria2" in enabled:
-        links.append(f"hysteria2://{quote(user['hy2_password'], safe='')}@{d}:{p['hysteria2']}/?sni={d}&obfs=salamander&obfs-password={quote(CONFIG['hy2_obfs_password'], safe='')}#{tag('03 Hysteria2')}")
+        links.append(f"hysteria2://{quote(user['hy2_password'], safe='')}@{d}:{p['hysteria2']}/?sni={d}&obfs=salamander&obfs-password={quote(CONFIG['hy2_obfs_password'], safe='')}#{tag('Hysteria2')}")
     if "shadowsocks2022" in enabled:
         password = f"{CONFIG['ss2022_server_password']}:{user['ss2022_password']}"
         userinfo = base64.urlsafe_b64encode(
             f"2022-blake3-aes-128-gcm:{password}".encode()
         ).decode().rstrip("=")
-        links.append(f"ss://{userinfo}@{d}:{p['shadowsocks2022']}#{tag('04 Shadowsocks 2022')}")
+        links.append(f"ss://{userinfo}@{d}:{p['shadowsocks2022']}#{tag('Shadowsocks 2022')}")
     if "tuic" in enabled:
-        links.append(f"tuic://{user['tuic_uuid']}:{quote(user['tuic_password'], safe='')}@{d}:{p['tuic']}?sni={d}&alpn=h3&congestion_control=cubic&udp_relay_mode=native#{tag('05 TUIC v5')}")
+        links.append(f"tuic://{user['tuic_uuid']}:{quote(user['tuic_password'], safe='')}@{d}:{p['tuic']}?sni={d}&alpn=h3&congestion_control=cubic&udp_relay_mode=native#{tag('TUIC v5')}")
     if "trojan" in enabled:
-        links.append(f"trojan://{quote(user['trojan_password'], safe='')}@{d}:{p['trojan']}?security=tls&sni={d}&type=tcp#{tag('06 Trojan TLS')}")
+        links.append(f"trojan://{quote(user['trojan_password'], safe='')}@{d}:{p['trojan']}?security=tls&sni={d}&type=tcp#{tag('Trojan TLS')}")
     dummy = "00000000-0000-0000-0000-000000000000"
     links.insert(0, f"vless://{dummy}@127.0.0.1:1?encryption=none&security=none&type=tcp#{tag(name1)}")
     links.insert(1, f"vless://{dummy}@127.0.0.1:2?encryption=none&security=none&type=tcp#{tag(name2)}")
@@ -834,40 +832,40 @@ def mihomo_subscription(user, row):
     actual = []
     if "reality" in enabled:
         actual.append({
-            "name": "01 VLESS-REALITY", "type": "vless", "server": d, "port": p["reality"],
+            "name": "VLESS-REALITY", "type": "vless", "server": d, "port": p["reality"],
             "uuid": user["vless_reality_uuid"], "network": "tcp", "tls": True, "udp": True,
             "flow": "xtls-rprx-vision", "servername": CONFIG["reality_server"], "client-fingerprint": "chrome",
             "reality-opts": {"public-key": CONFIG["reality_public_key"], "short-id": CONFIG["reality_short_id"]},
         })
     if "anytls" in enabled:
         actual.append({
-            "name": "02 AnyTLS", "type": "anytls", "server": d, "port": p["anytls"],
+            "name": "AnyTLS", "type": "anytls", "server": d, "port": p["anytls"],
             "password": user["anytls_password"], "sni": d, "udp": True,
             "skip-cert-verify": False, "client-fingerprint": "chrome",
         })
     if "hysteria2" in enabled:
         actual.append({
-            "name": "03 Hysteria2", "type": "hysteria2", "server": d, "port": p["hysteria2"],
+            "name": "Hysteria2", "type": "hysteria2", "server": d, "port": p["hysteria2"],
             "password": user["hy2_password"], "sni": d, "skip-cert-verify": False,
             "obfs": "salamander", "obfs-password": CONFIG["hy2_obfs_password"],
         })
     if "shadowsocks2022" in enabled:
         actual.append({
-            "name": "04 Shadowsocks 2022", "type": "ss", "server": d,
+            "name": "Shadowsocks 2022", "type": "ss", "server": d,
             "port": p["shadowsocks2022"], "cipher": "2022-blake3-aes-128-gcm",
             "password": f"{CONFIG['ss2022_server_password']}:{user['ss2022_password']}",
             "udp": True, "udp-over-tcp": True, "udp-over-tcp-version": 2,
         })
     if "tuic" in enabled:
         actual.append({
-            "name": "05 TUIC v5", "type": "tuic", "server": d, "port": p["tuic"],
+            "name": "TUIC v5", "type": "tuic", "server": d, "port": p["tuic"],
             "uuid": user["tuic_uuid"], "password": user["tuic_password"], "sni": d,
             "skip-cert-verify": False, "congestion-controller": "cubic",
             "udp-relay-mode": "native", "reduce-rtt": False,
         })
     if "trojan" in enabled:
         actual.append({
-            "name": "06 Trojan TLS", "type": "trojan", "server": d, "port": p["trojan"],
+            "name": "Trojan TLS", "type": "trojan", "server": d, "port": p["trojan"],
             "password": user["trojan_password"], "sni": d, "skip-cert-verify": False,
             "udp": True, "network": "tcp",
         })
@@ -906,17 +904,17 @@ def quanx_subscription(user, row):
         f"shadowsocks=127.0.0.1:2, method=aes-128-gcm, password=info-only, udp-relay=false, tag={info2}",
     ]
     if "reality" in enabled:
-        lines.append(f"vless={d}:{p['reality']}, method=none, password={user['vless_reality_uuid']}, obfs=over-tls, obfs-host={CONFIG['reality_server']}, reality-base64-pubkey={CONFIG['reality_public_key']}, reality-hex-shortid={CONFIG['reality_short_id']}, vless-flow=xtls-rprx-vision, udp-relay=true, tag=01 VLESS-REALITY")
+        lines.append(f"vless={d}:{p['reality']}, method=none, password={user['vless_reality_uuid']}, obfs=over-tls, obfs-host={CONFIG['reality_server']}, reality-base64-pubkey={CONFIG['reality_public_key']}, reality-hex-shortid={CONFIG['reality_short_id']}, vless-flow=xtls-rprx-vision, udp-relay=true, tag=VLESS-REALITY")
     if "anytls" in enabled:
-        lines.append(f"anytls={d}:{p['anytls']}, password={user['anytls_password']}, over-tls=true, tls-host={d}, tls-verification=true, udp-relay=true, tag=02 AnyTLS")
+        lines.append(f"anytls={d}:{p['anytls']}, password={user['anytls_password']}, over-tls=true, tls-host={d}, tls-verification=true, udp-relay=true, tag=AnyTLS")
     if "hysteria2" in enabled:
-        lines.append("shadowsocks=127.0.0.1:3, method=aes-128-gcm, password=unsupported, udp-relay=false, tag=03 Hysteria2（QuanX不支持）")
+        lines.append("shadowsocks=127.0.0.1:3, method=aes-128-gcm, password=unsupported, udp-relay=false, tag=Hysteria2（QuanX不支持）")
     if "shadowsocks2022" in enabled:
-        lines.append("shadowsocks=127.0.0.1:4, method=aes-128-gcm, password=unsupported, udp-relay=false, tag=04 Shadowsocks 2022（QuanX不支持）")
+        lines.append("shadowsocks=127.0.0.1:4, method=aes-128-gcm, password=unsupported, udp-relay=false, tag=Shadowsocks 2022（QuanX不支持）")
     if "tuic" in enabled:
-        lines.append("shadowsocks=127.0.0.1:5, method=aes-128-gcm, password=unsupported, udp-relay=false, tag=05 TUIC v5（QuanX不支持）")
+        lines.append("shadowsocks=127.0.0.1:5, method=aes-128-gcm, password=unsupported, udp-relay=false, tag=TUIC v5（QuanX不支持）")
     if "trojan" in enabled:
-        lines.append(f"trojan={d}:{p['trojan']}, password={user['trojan_password']}, over-tls=true, tls-host={d}, tls-verification=true, fast-open=false, udp-relay=true, tag=06 Trojan TLS")
+        lines.append(f"trojan={d}:{p['trojan']}, password={user['trojan_password']}, over-tls=true, tls-host={d}, tls-verification=true, fast-open=false, udp-relay=true, tag=Trojan TLS")
     return "\n".join(lines) + "\n"
 
 class Handler(BaseHTTPRequestHandler):
