@@ -20,16 +20,24 @@ BUILD_ROOT=""
 INSTALL_SUCCEEDED=0
 SING_BOX_WAS_ACTIVE=0
 PROXY_MANAGER_WAS_ACTIVE=0
-cleanup() {
+cleanup_build_environment() {
   if [[ "$TEMP_SWAP" == "1" ]] && swapon --show=NAME --noheadings | grep -qx '/swapfile-proxy-build'; then
-    swapoff /swapfile-proxy-build || true
+    if swapoff /swapfile-proxy-build; then
+      TEMP_SWAP=0
+    fi
   fi
-  if [[ "$TEMP_SWAP_CREATED" == "1" ]]; then
+  if [[ "$TEMP_SWAP_CREATED" == "1" ]] && ! swapon --show=NAME --noheadings | grep -qx '/swapfile-proxy-build'; then
     rm -f /swapfile-proxy-build
+    TEMP_SWAP_CREATED=0
   fi
-  if [[ -n "$BUILD_ROOT" && -d "$BUILD_ROOT" ]]; then
+  if [[ "$BUILD_ROOT" == /opt/proxy-build.* && -d "$BUILD_ROOT" ]]; then
     rm -rf -- "$BUILD_ROOT"
+    BUILD_ROOT=""
   fi
+}
+
+cleanup() {
+  cleanup_build_environment
   if [[ "$INSTALL_SUCCEEDED" != "1" ]]; then
     if [[ "$SING_BOX_WAS_ACTIVE" == "1" ]]; then
       systemctl start sing-box >/dev/null 2>&1 || true
@@ -279,31 +287,64 @@ if ! "$SB_BIN" version 2>/dev/null | grep -q 'with_v2ray_api'; then
       exit 1
       ;;
   esac
+  BUILD_ROOT=$(mktemp -d /opt/proxy-build.XXXXXX)
+  BUILD_BIN_DIR="$BUILD_ROOT/bin"
+  GO_ARCHIVE="$BUILD_ROOT/go.tar.gz"
+  BUILD_TMP_DIR="$BUILD_ROOT/tmp"
+  BUILD_GO_CACHE="$BUILD_ROOT/go-cache"
+  BUILD_GO_PATH="$BUILD_ROOT/go-path"
+  BUILD_HOME="$BUILD_ROOT/home"
+  mkdir -p "$BUILD_BIN_DIR" "$BUILD_TMP_DIR" "$BUILD_GO_CACHE" "$BUILD_GO_PATH" "$BUILD_HOME"
+  TEMP_SWAP_SIZE_MB=0
   if [[ -z "$(swapon --show=NAME --noheadings)" ]]; then
-    fallocate -l 2G /swapfile-proxy-build
+    # 单线程编译在 1 GiB VPS 上只需少量兜底交换空间；固定创建 2 GiB 会先耗尽小磁盘。
+    MEMORY_AVAILABLE_MB=$(awk '/MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)
+    if (( MEMORY_AVAILABLE_MB < 1280 )); then
+      TEMP_SWAP_SIZE_MB=$((1280 - MEMORY_AVAILABLE_MB))
+      if (( TEMP_SWAP_SIZE_MB < 256 )); then
+        TEMP_SWAP_SIZE_MB=256
+      elif (( TEMP_SWAP_SIZE_MB > 1024 )); then
+        TEMP_SWAP_SIZE_MB=1024
+      fi
+    fi
+  fi
+  BUILD_FREE_MB=$(df -Pm "$BUILD_ROOT" | awk 'NR == 2 {print $4}')
+  BUILD_REQUIRED_MB=$((2300 + TEMP_SWAP_SIZE_MB))
+  if (( BUILD_FREE_MB < BUILD_REQUIRED_MB )); then
+    echo "可用磁盘空间不足：当前 ${BUILD_FREE_MB} MiB，编译预计至少需要 ${BUILD_REQUIRED_MB} MiB。" >&2
+    echo "请清理根分区后重新运行安装程序。" >&2
+    exit 1
+  fi
+  if (( TEMP_SWAP_SIZE_MB > 0 )); then
+    fallocate -l "${TEMP_SWAP_SIZE_MB}M" /swapfile-proxy-build
     TEMP_SWAP_CREATED=1
     chmod 600 /swapfile-proxy-build
     mkswap /swapfile-proxy-build >/dev/null
     swapon /swapfile-proxy-build
     TEMP_SWAP=1
   fi
-  BUILD_ROOT=$(mktemp -d /opt/proxy-build.XXXXXX)
-  BUILD_BIN_DIR="$BUILD_ROOT/bin"
-  GO_ARCHIVE="$BUILD_ROOT/go.tar.gz"
-  mkdir -p "$BUILD_BIN_DIR"
   GO_VERSION=$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1)
   curl -fL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o "$GO_ARCHIVE"
   tar -C "$BUILD_ROOT" -xzf "$GO_ARCHIVE"
+  rm -f "$GO_ARCHIVE"
   SB_VERSION=$($SB_BIN version | awk '/sing-box version/ {gsub(/^v/, "", $3); print $3; exit}')
   if [[ -z "$SB_VERSION" ]]; then
     echo "无法识别 sing-box 版本。"
     exit 1
   fi
-  HOME=/root GOBIN="$BUILD_BIN_DIR" CGO_ENABLED=0 GOMAXPROCS=1 \
+  if ! HOME="$BUILD_HOME" TMPDIR="$BUILD_TMP_DIR" \
+    GOPATH="$BUILD_GO_PATH" GOMODCACHE="$BUILD_GO_PATH/pkg/mod" GOCACHE="$BUILD_GO_CACHE" \
+    GOBIN="$BUILD_BIN_DIR" CGO_ENABLED=0 GOMAXPROCS=1 \
     GOFLAGS='-p=1 -tags=with_quic,with_utls,with_v2ray_api' \
-    "$BUILD_ROOT/go/bin/go" install "github.com/sagernet/sing-box/cmd/sing-box@v${SB_VERSION}"
+    "$BUILD_ROOT/go/bin/go" install "github.com/sagernet/sing-box/cmd/sing-box@v${SB_VERSION}"; then
+    echo "sing-box 编译失败。当前磁盘空间：" >&2
+    df -h /opt "$BUILD_TMP_DIR" >&2 || true
+    echo "请确保根分区至少有约 3 GiB 可用空间后重新运行安装程序。" >&2
+    exit 1
+  fi
   install -m 755 "$BUILD_BIN_DIR/sing-box" /usr/local/bin/sing-box
   SB_BIN=/usr/local/bin/sing-box
+  cleanup_build_environment
 fi
 
 if ! "$SB_BIN" version | grep -q 'with_v2ray_api'; then
