@@ -1936,8 +1936,9 @@ show_menu() {
 │  6. 服务管理                     │
 │  7. 防火墙                       │
 │  8. 节点信息                     │
-│  9. 更新版本                     │
-│ 10. 卸载                         │
+│  9. BBR 管理                     │
+│ 10. 更新版本                     │
+│ 11. 卸载                         │
 │  0. 退出                         │
 ╚──────────────────────────────────╝"
 }
@@ -2037,6 +2038,102 @@ show_node_info() {
   fi
 }
 
+show_bbr_status() {
+  local available current qdisc
+  available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+  current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+  qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+  echo "可用拥塞控制算法: ${available:-无法读取}"
+  echo "当前拥塞控制算法: ${current:-无法读取}"
+  echo "当前默认队列规则: ${qdisc:-无法读取}"
+  if [[ "$current" == "bbr" ]]; then
+    echo "BBR 状态: 已开启"
+  else
+    echo "BBR 状态: 未开启"
+  fi
+}
+
+restore_network_settings() {
+  local old_congestion=$1
+  local old_qdisc=$2
+  sysctl -w "net.ipv4.tcp_congestion_control=${old_congestion}" >/dev/null 2>&1 || true
+  sysctl -w "net.core.default_qdisc=${old_qdisc}" >/dev/null 2>&1 || true
+}
+
+enable_bbr() {
+  local available old_congestion old_qdisc temp_config
+  local config_path=/etc/sysctl.d/99-st-sb-bbr.conf
+  old_congestion=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+  old_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+  if [[ -z "$old_congestion" || -z "$old_qdisc" ]]; then
+    echo "无法读取当前网络参数，未修改系统配置。" >&2
+    return 1
+  fi
+
+  available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+  if [[ " $available " != *" bbr "* ]]; then
+    modprobe tcp_bbr 2>/dev/null || true
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+  fi
+  if [[ " $available " != *" bbr "* ]]; then
+    echo "当前内核不支持 BBR，请先升级内核。" >&2
+    return 1
+  fi
+
+  if ! sysctl -w net.core.default_qdisc=fq >/dev/null || \
+    ! sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null; then
+    restore_network_settings "$old_congestion" "$old_qdisc"
+    echo "应用 BBR 参数失败，已恢复原网络设置。" >&2
+    return 1
+  fi
+
+  install -d -m 755 /etc/sysctl.d
+  if ! temp_config=$(mktemp /etc/sysctl.d/.99-st-sb-bbr.conf.XXXXXX); then
+    restore_network_settings "$old_congestion" "$old_qdisc"
+    echo "无法创建 BBR 配置文件，已恢复原网络设置。" >&2
+    return 1
+  fi
+  if ! printf '%s\n' \
+    'net.core.default_qdisc = fq' \
+    'net.ipv4.tcp_congestion_control = bbr' > "$temp_config" || \
+    ! chmod 644 "$temp_config" || \
+    ! mv -f "$temp_config" "$config_path"; then
+    rm -f -- "$temp_config"
+    restore_network_settings "$old_congestion" "$old_qdisc"
+    echo "保存 BBR 配置失败，已恢复原网络设置。" >&2
+    return 1
+  fi
+
+  if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" != "bbr" ]]; then
+    rm -f -- "$config_path"
+    restore_network_settings "$old_congestion" "$old_qdisc"
+    echo "BBR 状态验证失败，请检查内核日志。" >&2
+    return 1
+  fi
+  echo "BBR 已开启，并已写入 ${config_path}。"
+}
+
+manage_bbr() {
+  local choice
+  echo "
+╔──────────────────────────────────╗
+│             BBR 管理             │
+╚──────────────────────────────────╝"
+  show_bbr_status
+  echo "
+╔──────────────────────────────────╗
+│  1. 开启或修复 BBR               │
+│  0. 返回                         │
+╚──────────────────────────────────╝"
+  read -r -p "请选择 [0-1]: " choice
+  echo
+  case "$choice" in
+    1) enable_bbr ;;
+    0) return ;;
+    *) echo "无效选择，请输入 0-1。" ;;
+  esac
+}
+
 update_proxy() {
   proxy-update
 }
@@ -2047,7 +2144,7 @@ uninstall_proxy() {
   local warning_count=0
   local -a firewall_rules=()
   echo "此操作将卸载 ST-SB 服务、配置、数据库、管理命令和 nginx 订阅站点。"
-  echo "Let’s Encrypt 证书、sing-box 程序、SSH/80/443 防火墙规则和卸载备份会保留。"
+  echo "Let’s Encrypt 证书、sing-box 程序、BBR 设置、SSH/80/443 防火墙规则和卸载备份会保留。"
   read -r -p "请输入 UNINSTALL 确认卸载: " confirm
   if [[ "$confirm" != "UNINSTALL" ]]; then
     echo "已取消卸载。"
@@ -2182,7 +2279,7 @@ PY
 
 while true; do
   show_menu
-  read -r -p "请选择 [0-10]: " choice
+  read -r -p "请选择 [0-11]: " choice
   echo
   case "$choice" in
     1) manage_protocols ;;
@@ -2193,14 +2290,15 @@ while true; do
     6) manage_services ;;
     7) show_firewall ;;
     8) show_node_info ;;
-    9) update_proxy ;;
-    10) uninstall_proxy ;;
+    9) manage_bbr ;;
+    10) update_proxy ;;
+    11) uninstall_proxy ;;
     0)
       echo "已退出代理节点管理。"
       exit 0
       ;;
     *)
-      echo "无效选择，请输入 0-10。"
+      echo "无效选择，请输入 0-11。"
       ;;
   esac
   pause_menu
