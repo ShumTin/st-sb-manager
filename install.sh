@@ -815,10 +815,10 @@ def uri_links(user, row):
     if "anytls" in enabled:
         links.append(f"anytls://{quote(user['anytls_password'], safe='')}@{d}:{p['anytls']}?security=tls&sni={d}&fp=chrome&type=tcp#{tag('AnyTLS')}")
     if "hysteria2" in enabled:
-        hy2_port = p["hysteria2"]
+        hy2_query = f"sni={d}&obfs=salamander&obfs-password={quote(CONFIG['hy2_obfs_password'], safe='')}"
         if "hy2_hop_start" in CONFIG:
-            hy2_port = f"{CONFIG['hy2_hop_start']}-{CONFIG['hy2_hop_end']}"
-        links.append(f"hysteria2://{quote(user['hy2_password'], safe='')}@{d}:{hy2_port}/?sni={d}&obfs=salamander&obfs-password={quote(CONFIG['hy2_obfs_password'], safe='')}#{tag('Hysteria2')}")
+            hy2_query += f"&mport={CONFIG['hy2_hop_start']}-{CONFIG['hy2_hop_end']}"
+        links.append(f"hysteria2://{quote(user['hy2_password'], safe='')}@{d}:{p['hysteria2']}/?{hy2_query}#{tag('Hysteria2')}")
     if "shadowsocks2022" in enabled:
         password = f"{CONFIG['ss2022_server_password']}:{user['ss2022_password']}"
         userinfo = base64.urlsafe_b64encode(
