@@ -152,7 +152,10 @@ for old_path in \
   /root/node-info.txt \
   /root/proxy-links.txt; do
   if [[ -e "$old_path" ]]; then
-    cp -a --parents "$old_path" "$BACKUP_DIR/"
+    # 重新安装时旧目录可能处于残缺状态；备份失败不应阻止重新安装。
+    if ! cp -a --parents -- "$old_path" "$BACKUP_DIR/"; then
+      echo "警告：无法备份 $old_path，继续执行重新安装。" >&2
+    fi
   fi
 done
 
