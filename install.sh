@@ -608,7 +608,8 @@ def init_db():
         conn.execute(
             "UPDATE usage SET upload=upload*?, download=download*?, accounting_version=? "
             "WHERE accounting_version<?",
-            (TRAFFIC_ACCOUNTING_FACTOR, TRAFFIC_ACCOUNTING_VERSION, TRAFFIC_ACCOUNTING_VERSION),
+            (TRAFFIC_ACCOUNTING_FACTOR, TRAFFIC_ACCOUNTING_FACTOR,
+             TRAFFIC_ACCOUNTING_VERSION, TRAFFIC_ACCOUNTING_VERSION),
         )
         period = datetime.now(TZ).strftime("%Y-%m-%d")
         for name in USERS_BY_NAME:
