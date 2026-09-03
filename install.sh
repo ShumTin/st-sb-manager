@@ -2435,6 +2435,7 @@ TARGETS = (
     Path("/opt/proxy-manager/manager.py"),
     Path("/opt/proxy-manager/audit_supervisor.py"),
     Path("/usr/local/sbin/proxy-user-add"),
+    Path("/usr/local/sbin/proxy-user-quota"),
     Path("/usr/local/sbin/proxy-protocol"),
     Path("/usr/local/sbin/proxy-node-info"),
     Path("/usr/local/sbin/proxy"),
