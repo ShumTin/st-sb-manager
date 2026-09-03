@@ -482,7 +482,8 @@ Path("/etc/proxy-manager/config.json").write_text(json.dumps(manager_config, ens
 info = [
     f"域名: {domain}",
     "协议管理: 安装后运行 proxy 并选择 1，按需启用或删除协议",
-    "用户管理: 启用协议后运行 proxy 并选择 2，按需创建用户",
+    "用户管理: 启用协议后运行 proxy，选择 2 进入用户管理，再选择新增、修改限额或查看状态",
+    "⚠️ 流量额度按服务商双向流量（入站 + 出站）口径统计；设置额度时直接填写服务商套餐 GiB，无需除以二",
     "套餐策略: 每个用户独立设置流量、到期时间和自动续期",
     "计费时区: America/New_York（与搬瓦工计费周期一致）",
     "搬瓦工下次流量重置: " + (
@@ -557,6 +558,9 @@ BILLING_TZ = ZoneInfo(CONFIG.get("billing_timezone", CONFIG["timezone"]))
 LOCK = threading.RLock()
 USERS_BY_TOKEN = {u["token"]: u for u in CONFIG["users"]}
 USERS_BY_NAME = {u["name"]: u for u in CONFIG["users"]}
+# 服务商按入站+出站计费；sing-box 用户统计只记录代理侧的一次传输。
+TRAFFIC_ACCOUNTING_VERSION = 2
+TRAFFIC_ACCOUNTING_FACTOR = 2
 
 def db():
     conn = sqlite3.connect(DB_PATH, timeout=20)
@@ -576,7 +580,8 @@ def init_db():
                 blocked INTEGER NOT NULL DEFAULT 0,
                 blocked_reason TEXT NOT NULL DEFAULT '',
                 last_upload INTEGER NOT NULL DEFAULT 0,
-                last_download INTEGER NOT NULL DEFAULT 0
+                last_download INTEGER NOT NULL DEFAULT 0,
+                accounting_version INTEGER NOT NULL DEFAULT 2
             )
         """)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(usage)")}
@@ -586,11 +591,19 @@ def init_db():
             conn.execute("ALTER TABLE usage ADD COLUMN last_upload INTEGER NOT NULL DEFAULT 0")
         if "last_download" not in columns:
             conn.execute("ALTER TABLE usage ADD COLUMN last_download INTEGER NOT NULL DEFAULT 0")
+        if "accounting_version" not in columns:
+            conn.execute("ALTER TABLE usage ADD COLUMN accounting_version INTEGER NOT NULL DEFAULT 1")
+        # 旧版本按单向流量累计；迁移后与服务商双向计费口径一致。
+        conn.execute(
+            "UPDATE usage SET upload=upload*?, download=download*?, accounting_version=? "
+            "WHERE accounting_version<?",
+            (TRAFFIC_ACCOUNTING_FACTOR, TRAFFIC_ACCOUNTING_VERSION, TRAFFIC_ACCOUNTING_VERSION),
+        )
         period = datetime.now(TZ).strftime("%Y-%m-%d")
         for name in USERS_BY_NAME:
             conn.execute(
-                "INSERT OR IGNORE INTO usage(name, upload, download, period, blocked) VALUES(?,0,0,?,0)",
-                (name, period),
+                "INSERT OR IGNORE INTO usage(name, upload, download, period, blocked, accounting_version) VALUES(?,0,0,?,0,?)",
+                (name, period, TRAFFIC_ACCOUNTING_VERSION),
             )
 
 def read_varint(data, pos):
@@ -800,7 +813,8 @@ def collect_once():
                 download_delta = current_download - row["last_download"] if current_download >= row["last_download"] else current_download
                 conn.execute(
                     "UPDATE usage SET upload=upload+?, download=download+?, last_upload=?, last_download=? WHERE name=?",
-                    (upload_delta, download_delta, current_upload, current_download, name),
+                    (upload_delta * TRAFFIC_ACCOUNTING_FACTOR, download_delta * TRAFFIC_ACCOUNTING_FACTOR,
+                     current_upload, current_download, name),
                 )
             rows = conn.execute("SELECT name, upload, download, blocked FROM usage").fetchall()
             for row in rows:
@@ -1067,7 +1081,7 @@ class UserInput:
     def __init__(self):
         parser = argparse.ArgumentParser(description="新增独立套餐的代理用户")
         parser.add_argument("--name", help="用户名：字母开头，仅限字母、数字、下划线、连字符")
-        parser.add_argument("--quota-gib", help="本有效期流量额度，单位 GiB")
+        parser.add_argument("--quota-gib", help="本有效期服务商双向流量额度，单位 GiB")
         parser.add_argument("--expires", help="自定义到期日期，格式 YYYY-MM-DD；省略时优先采用搬瓦工重置时间")
         parser.add_argument("--auto-renew", choices=("yes", "no"), help="到期后是否自动续期")
         parser.add_argument("--renewal-months", type=int, help="每次自动续期的自然月数，默认1个月")
@@ -1105,7 +1119,8 @@ class UserInput:
 
     def read(self, timezone, provider_next_reset):
         name = self.prompt(self.args.name, "用户名: ")
-        quota_text = self.prompt(self.args.quota_gib, "流量额度 GiB（例如 200）: ")
+        print("⚠️ 流量额度按服务商双向流量（入站 + 出站）统计，请直接填写服务商套餐额度。")
+        quota_text = self.prompt(self.args.quota_gib, "服务商双向流量额度 GiB（例如 200）: ")
         default_expiry = self.default_expiry(timezone, provider_next_reset)
         expires_text = self.prompt(
             self.args.expires,
@@ -1327,7 +1342,7 @@ class ProxyUserManager:
     def insert_usage(user):
         with sqlite3.connect(USAGE_DB_PATH) as conn:
             conn.execute(
-                "INSERT INTO usage(name,upload,download,period,blocked,blocked_reason) VALUES(?,0,0,?,0,'')",
+                "INSERT INTO usage(name,upload,download,period,blocked,blocked_reason,accounting_version) VALUES(?,0,0,?,0,'',2)",
                 (user["name"], datetime.now().strftime("%Y-%m-%d")),
             )
 
@@ -1404,6 +1419,62 @@ if __name__ == "__main__":
     main()
 PY
 chmod 700 /usr/local/sbin/proxy-user-add
+
+cat > /usr/local/sbin/proxy-user-quota <<'PY'
+#!/usr/bin/env python3
+import json
+import os
+import tempfile
+import subprocess
+from pathlib import Path
+
+CONFIG_PATH = Path("/etc/proxy-manager/config.json")
+
+def save_config(config):
+    fd, temp_path = tempfile.mkstemp(prefix="config.", dir=str(CONFIG_PATH.parent))
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(config, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, CONFIG_PATH)
+    finally:
+        Path(temp_path).unlink(missing_ok=True)
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit("请使用 root 运行：sudo proxy-user-quota")
+    config = json.loads(CONFIG_PATH.read_text())
+    users = config.get("users", [])
+    if not users:
+        raise SystemExit("当前没有用户。")
+    print("⚠️ 流量额度按服务商双向流量（入站 + 出站）统计，请直接填写服务商套餐额度。")
+    print("当前用户：")
+    for index, user in enumerate(users, 1):
+        print(f"  {index}. {user['name']}（当前 {user['quota_bytes'] / 1024**3:g} GiB）")
+    choice = input("请选择用户编号: ").strip()
+    try:
+        user = users[int(choice) - 1]
+    except (ValueError, IndexError):
+        raise SystemExit("无效的用户编号。")
+    quota_text = input("新的服务商双向流量额度 GiB: ").strip()
+    try:
+        quota_gib = float(quota_text)
+    except ValueError as exc:
+        raise SystemExit("流量额度必须是数字。") from exc
+    if not 0 < quota_gib <= 1048576:
+        raise SystemExit("流量额度必须大于 0 且不超过 1048576 GiB。")
+    user["quota_bytes"] = int(quota_gib * 1024**3)
+    save_config(config)
+    subprocess.run(["systemctl", "restart", "proxy-manager"], check=True, timeout=30)
+    print(f"用户 {user['name']} 的流量额度已修改为 {quota_gib:g} GiB。")
+
+if __name__ == "__main__":
+    main()
+PY
+chmod 700 /usr/local/sbin/proxy-user-quota
 
 cat > /usr/local/sbin/proxy-protocol <<'PY'
 #!/usr/bin/env python3
@@ -1929,16 +2000,15 @@ show_menu() {
 │           代理节点管理           │
 ├──────────────────────────────────┤
 │  1. 协议管理                     │
-│  2. 新增用户                     │
-│  3. 用户状态                     │
-│  4. 访问审计                     │
-│  5. 配置检查                     │
-│  6. 服务管理                     │
-│  7. 防火墙                       │
-│  8. 节点信息                     │
-│  9. BBR 管理                     │
-│ 10. 更新版本                     │
-│ 11. 卸载                         │
+│  2. 用户管理                     │
+│  3. 访问审计                     │
+│  4. 配置检查                     │
+│  5. 服务管理                     │
+│  6. 防火墙                       │
+│  7. 节点信息                     │
+│  8. BBR 管理                     │
+│  9. 更新版本                     │
+│ 10. 卸载                         │
 │  0. 退出                         │
 ╚──────────────────────────────────╝"
 }
@@ -1951,8 +2021,36 @@ add_user() {
   proxy-user-add
 }
 
+edit_user_quota() {
+  proxy-user-quota
+}
+
 show_users() {
   proxy-user-status
+}
+
+manage_users() {
+  local choice
+  while true; do
+    echo "
+╔──────────────────────────────────╗
+│             用户管理             │
+├──────────────────────────────────┤
+│  1. 新增用户                     │
+│  2. 修改用户限额                 │
+│  3. 用户状态                     │
+│  0. 返回                         │
+╚──────────────────────────────────╝"
+    read -r -p "请选择 [0-3]: " choice
+    echo
+    case "$choice" in
+      1) add_user; pause_menu ;;
+      2) edit_user_quota; pause_menu ;;
+      3) show_users; pause_menu ;;
+      0) return ;;
+      *) echo "无效选择，请输入 0-3。" ;;
+    esac
+  done
 }
 
 show_recent_audit() {
@@ -2183,6 +2281,7 @@ uninstall_proxy() {
     /usr/local/sbin/proxy-node-info \
     /usr/local/sbin/proxy-update \
     /usr/local/sbin/proxy-user-add \
+    /usr/local/sbin/proxy-user-quota \
     /usr/local/sbin/proxy-user-status \
     /usr/local/sbin/proxy-audit \
     /root/node-info.txt \
@@ -2279,26 +2378,25 @@ PY
 
 while true; do
   show_menu
-  read -r -p "请选择 [0-11]: " choice
+  read -r -p "请选择 [0-10]: " choice
   echo
   case "$choice" in
     1) manage_protocols ;;
-    2) add_user ;;
-    3) show_users ;;
-    4) manage_audit ;;
-    5) check_singbox_config ;;
-    6) manage_services ;;
-    7) show_firewall ;;
-    8) show_node_info ;;
-    9) manage_bbr ;;
-    10) update_proxy ;;
-    11) uninstall_proxy ;;
+    2) manage_users; continue ;;
+    3) manage_audit ;;
+    4) check_singbox_config ;;
+    5) manage_services ;;
+    6) show_firewall ;;
+    7) show_node_info ;;
+    8) manage_bbr ;;
+    9) update_proxy ;;
+    10) uninstall_proxy ;;
     0)
       echo "已退出代理节点管理。"
       exit 0
       ;;
     *)
-      echo "无效选择，请输入 0-11。"
+      echo "无效选择，请输入 0-10。"
       ;;
   esac
   pause_menu
