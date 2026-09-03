@@ -381,7 +381,7 @@ nginx -t
 systemctl enable --now nginx
 systemctl reload nginx
 
-(
+if ! (
   # Certbot 创建的临时验证文件需要能被 nginx worker 读取。
   umask 022
   certbot certonly \
@@ -392,7 +392,15 @@ systemctl reload nginx
     --agree-tos \
     --no-eff-email \
     --non-interactive
-)
+); then
+  echo ""
+  echo "Let's Encrypt 证书申请失败。请确认："
+  echo "  1. 服务商安全组已放行 TCP 80（HTTP 验证）和 TCP 443（HTTPS）；"
+  echo "  2. 域名 A 记录已解析到本机公网 IPv4；"
+  echo "  3. 80/443 端口没有被其他服务占用，且可从公网访问。"
+  echo "安全组规则不由 UFW 控制，请在服务商控制台放行后重新运行安装脚本。"
+  exit 1
+fi
 
 install -d -m 700 /etc/sing-box /etc/proxy-manager /opt/proxy-manager
 install -d -m 700 /var/lib/proxy-manager
